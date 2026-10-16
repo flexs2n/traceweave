@@ -1,0 +1,29 @@
+# Golden retrieval suite for the rust-sample fixture (plan T5).
+# Tuning cases inform ranking experiments; held-out cases are scored
+# separately and never used to tune weights (TIS §19.4).
+
+name = "fixture"
+
+[[cases]]
+task = "how does read_config get called"
+budget = 3000
+expect_symbols = ["read_config", "run_app"]
+expect_files = ["src/util.rs", "src/lib.rs"]
+forbidden_paths = ["vendor/dep.rs", "notes.md", "data.bin"]
+kind = "tuning"
+
+[[cases]]
+task = "fix the smoke test that exercises run_app"
+budget = 3000
+expect_symbols = ["run_app"]
+expect_files = ["tests/smoke.rs"]
+forbidden_paths = ["vendor/dep.rs", "notes.md"]
+kind = "tuning"
+
+[[cases]]
+task = "how does run_app use the configuration"
+budget = 2000
+expect_symbols = ["read_config"]
+expect_files = ["src/util.rs"]
+forbidden_paths = ["vendor/dep.rs", "notes.md"]
+kind = "held_out"

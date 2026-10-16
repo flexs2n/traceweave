@@ -222,7 +222,7 @@ pub async fn run_index(
             content_hash: &fr.content_hash,
         });
     }
-    record_symbol_facts(
+    let claim_ids = record_symbol_facts(
         evidence_store,
         repo.repository_id,
         snapshot.snapshot_id,
@@ -232,8 +232,27 @@ pub async fn run_index(
     .await?;
 
     // 9. Selective invalidation of claims depending on changed files (FR-040).
+    let mut changed_paths: Vec<String> = Vec::new();
     if !full_rebuild {
-        invalidate_previous_claims(index_store, evidence_store, repo, manifest).await?;
+        changed_paths =
+            invalidate_previous_claims(index_store, evidence_store, repo, manifest).await?;
+    }
+    // Claims recorded THIS run for changed files start stale: the source
+    // changed beneath them, so revalidation is owed even though the text
+    // re-describes the current source (TIS §6.3, SDD §20.5 integrity
+    // scenario). Verification later flips them `supported` (SDD §15.6).
+    if !changed_paths.is_empty() {
+        let owed: Vec<ClaimId> = facts
+            .iter()
+            .zip(claim_ids.iter())
+            .filter(|(fact, _)| changed_paths.iter().any(|p| p == fact.path))
+            .map(|(_, claim_id)| *claim_id)
+            .collect();
+        if !owed.is_empty() {
+            evidence_store
+                .mark_claims_stale(&owed, &now_rfc3339())
+                .await?;
+        }
     }
 
     // 10. Atomic publication (TIS §4.4 steps 4–6, SDD §7.5).
@@ -854,36 +873,41 @@ fn build_search_entries(files: &[ClassifiedFile], symbols: &[SymbolRecord]) -> V
 
 /// Selective claim invalidation (FR-040, TIS §8.1): flips dependent claims of
 /// files (and their symbols) whose content changed since the previously
-/// published generation.
+/// published generation. Returns the repo-relative paths that changed
+/// (content differs or file removed) compared to the previous generation.
 async fn invalidate_previous_claims(
     index_store: &dyn IndexStore,
     evidence_store: &dyn EvidenceStore,
     repo: &RepositoryRecord,
     current_manifest: &BTreeMap<String, String>,
-) -> StoreResult<()> {
+) -> StoreResult<Vec<String>> {
     let Some(previous) = index_store
         .get_active_generation(repo.repository_id)
         .await?
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let Some(previous_generation) = index_store.get_generation(previous.generation_id).await?
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let previous_files = index_store
         .list_files(previous_generation.snapshot_id)
         .await?;
 
+    let mut changed_paths: Vec<String> = Vec::new();
     let mut changed_file_ids: Vec<String> = Vec::new();
     for f in &previous_files {
         match current_manifest.get(&f.path) {
             Some(hash) if hash == &f.content_hash => {}
-            _ => changed_file_ids.push(f.file_id.to_string()),
+            _ => {
+                changed_paths.push(f.path.clone());
+                changed_file_ids.push(f.file_id.to_string());
+            }
         }
     }
     if changed_file_ids.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut changed_symbol_ids = Vec::new();
     for file_id_str in &changed_file_ids {
@@ -903,7 +927,7 @@ async fn invalidate_previous_claims(
         &changed_symbol_ids,
     )
     .await?;
-    Ok(())
+    Ok(changed_paths)
 }
 
 // ---------------------------------------------------------------------------

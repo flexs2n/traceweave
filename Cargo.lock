@@ -255,6 +255,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ccc-evaluation"
+version = "0.1.0"
+dependencies = [
+ "ccc-config",
+ "ccc-context-compiler",
+ "ccc-domain",
+ "ccc-indexer",
+ "ccc-repository",
+ "ccc-schema",
+ "ccc-search",
+ "ccc-snapshot",
+ "ccc-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "ccc-evidence"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,44 @@
+# Dogfood suite: real tasks against traceweave itself (plan T5/T10).
+# Run from the repository root: ccc eval run --suite dogfood
+
+name = "dogfood"
+
+[[cases]]
+task = "how does begin_job make job creation idempotent"
+budget = 3000
+expect_symbols = ["begin_job", "idempotency_key"]
+expect_files = ["crates/ccc-jobs/src/lib.rs"]
+forbidden_paths = ["target"]
+kind = "tuning"
+
+[[cases]]
+task = "where is the FTS5 availability smoke test executed"
+budget = 3000
+expect_symbols = ["smoke_test_fts5"]
+expect_files = ["crates/ccc-storage/src/sqlite.rs"]
+forbidden_paths = ["target"]
+kind = "tuning"
+
+[[cases]]
+task = "how does run_index publish a generation atomically"
+budget = 3000
+expect_symbols = ["run_index", "publish_generation"]
+expect_files = ["crates/ccc-indexer/src/lib.rs", "crates/ccc-storage/src/sqlite.rs"]
+forbidden_paths = ["target"]
+kind = "tuning"
+
+[[cases]]
+task = "how does invalidate_for_changes scope claim invalidation"
+budget = 2500
+expect_symbols = ["invalidate_for_changes"]
+expect_files = ["crates/ccc-evidence/src/lib.rs"]
+forbidden_paths = ["target"]
+kind = "tuning"
+
+[[cases]]
+task = "how does the verification engine authorize command execution"
+budget = 3000
+expect_symbols = ["execute_check", "classify"]
+expect_files = ["crates/ccc-verification/src/executor.rs", "crates/ccc-verification/src/policy.rs"]
+forbidden_paths = ["target"]
+kind = "held_out"

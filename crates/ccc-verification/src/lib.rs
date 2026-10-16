@@ -257,13 +257,17 @@ impl<'a> VerificationEngine<'a> {
         })
         .await?;
 
+        // Claims tied to the changed set that are or will become stale
+        // (TIS §11.1 step 4). After a reindex the dependent claims are
+        // already stale (the indexer marks changed-file claims stale); they
+        // are listed here so the record shows the freshness scope.
         let mut newly_stale_claims: Vec<String> = impact
             .affected_claims
             .iter()
-            .filter(|c| c.would_become_stale)
             .map(|c| c.claim_id.clone())
             .collect();
         newly_stale_claims.sort();
+        newly_stale_claims.dedup();
 
         let mut limitations = vec![
             "Selected checks are recommendations; running them does not prove that every \

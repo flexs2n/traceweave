@@ -3,7 +3,8 @@
 //!
 //! Flow: init → repo add → index → search → modify one file → incremental
 //! reindex (reparse count == 1) → compile (deterministic bundle_hash) →
-//! impact analyze → export → declared-not-implemented commands.
+//! impact analyze → export → verify analysis mode (zero execution) →
+//! policies → declared-not-implemented commands.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -283,15 +284,55 @@ fn golden_vertical_path() {
         "excluded content never in exports"
     );
 
-    // verify — declared not implemented with a stable code (EXECUTION_NOT_AUTHORIZED).
-    let verify = cli.run(&["verify", "--policy", "strict"]);
-    assert!(!verify.status.success());
-    assert_eq!(stderr_code(&verify), "EXECUTION_NOT_AUTHORIZED");
+    // verify — unknown policy names are rejected with a stable code (policies
+    // come only from the data dir; there is no "strict" policy here).
+    let verify_unknown = cli.run(&["verify", "--base", "HEAD~1", "--policy", "strict"]);
+    assert!(!verify_unknown.status.success());
+    assert_eq!(stderr_code(&verify_unknown), "INVALID_REQUEST");
+
+    // verify analysis mode — a real change produces a full report with zero
+    // execution: every executable suggestion is `not_run`, never `passed`.
+    let verify = cli.json(&["verify", "--base", "HEAD~1", "--head", "HEAD"]);
+    let checks = verify["data"]["checks"].as_array().unwrap();
+    assert!(!checks.is_empty(), "suggestions are present");
+    assert!(
+        checks
+            .iter()
+            .all(|c| c["status"] == "not_run" && c["exit_code"].is_null()),
+        "analysis mode executes nothing: {checks:?}"
+    );
+    assert_eq!(verify["data"]["mode"], "analysis");
+    assert_eq!(verify["data"]["statuses"]["passed"], 0);
+    assert_eq!(verify["data"]["statuses"]["not_run"], checks.len() as u64);
+    assert_eq!(verify["data"]["policy_name"], "analysis");
+    assert!(verify["data"]["policy_hash"].as_str().is_some());
+    assert!(
+        verify["data"]["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("no command was executed")),
+        "the analysis limitation is stated, never hidden"
+    );
 
     // eval run — declared not implemented (INVALID_REQUEST).
     let eval = cli.run(&["eval", "run", "--suite", "baseline"]);
     assert!(!eval.status.success());
     assert_eq!(stderr_code(&eval), "INVALID_REQUEST");
+
+    // policies list/show — data-dir sourced; the built-in analysis policy is
+    // always present and never allows execution.
+    let policies = cli.json(&["policies", "list"]);
+    let names: Vec<&str> = policies["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"analysis"));
+    let show = cli.json(&["policies", "show", "analysis"]);
+    assert_eq!(show["data"]["allow_execution"], false);
+    assert_eq!(show["data"]["name"], "analysis");
 
     // json error envelope on failure path.
     let bad = cli.run(&["--json", "search", "x", "--limit", "0"]);

@@ -19,6 +19,7 @@ ccc-search = { workspace = true }
 ccc-evidence = { workspace = true }
 ccc-context-compiler = { workspace = true }
 ccc-impact = { workspace = true }
+ccc-verification = { workspace = true }
 ccc-jobs = { workspace = true }
 ccc-schema = { workspace = true }
 ccc-tree-sitter = { workspace = true }

@@ -206,6 +206,7 @@ dependencies = [
  "ccc-snapshot",
  "ccc-storage",
  "ccc-tree-sitter",
+ "ccc-verification",
  "clap",
  "serde",
  "serde_json",
@@ -371,6 +372,25 @@ dependencies = [
  "serde",
  "tree-sitter",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "ccc-verification"
+version = "0.1.0"
+dependencies = [
+ "ccc-config",
+ "ccc-domain",
+ "ccc-impact",
+ "ccc-indexer",
+ "ccc-repository",
+ "ccc-schema",
+ "ccc-snapshot",
+ "ccc-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

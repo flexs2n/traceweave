@@ -2,9 +2,9 @@
 //!
 //! Human-readable output is the default; `--json` produces full,
 //! never-truncated machine envelopes. Errors exit non-zero with a stable
-//! error-code JSON on stderr. Declared-but-unimplemented commands (`ccc
-//! verify`, `ccc eval run`) say so explicitly instead of pretending
-//! availability (ui.md §3.2 principle, no false availability).
+//! error-code JSON on stderr. `ccc eval run` is declared-but-unimplemented in
+//! this build and says so explicitly instead of pretending availability
+//! (ui.md §3.2, no false availability).
 
 use ccc_context_compiler::{CompileRequest, ContextCompiler, HeuristicNormalizer};
 use ccc_domain::*;
@@ -89,10 +89,29 @@ enum Command {
     },
     /// Environment diagnostics.
     Doctor,
-    /// Patch verification (NOT IMPLEMENTED in this build; analysis-only, ADR-008).
+    /// Verify a patch under an execution policy (analysis-only by default,
+    /// TIS §11; suggestions are advisory until a policy authorizes execution).
     Verify {
+        /// Base revision (required).
         #[arg(long)]
+        base: String,
+        /// Head revision (omitted: working tree).
+        #[arg(long)]
+        head: Option<String>,
+        /// Policy name from the data dir (default: built-in `analysis`).
+        #[arg(long, default_value = "analysis")]
         policy: String,
+        /// Output format: json or markdown.
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Inspect verification policies (data-dir sourced; repo content can
+    /// never define or override a policy, TIS §11.2).
+    Policies {
+        #[command(subcommand)]
+        command: PoliciesCommand,
     },
     /// Offline evaluation (NOT IMPLEMENTED in this build).
     Eval {
@@ -164,6 +183,14 @@ enum EvalCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PoliciesCommand {
+    /// List available policy names (built-in default + data-dir policies).
+    List,
+    /// Show one policy's effective contents and hash.
+    Show { name: String },
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -192,9 +219,10 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
     match &cli.command {
         Command::Init => cmd_init(&data_dir, cli.json).await,
         Command::Doctor => cmd_doctor(&data_dir, cli.json).await,
-        Command::Verify { .. } => Err(CccError::execution_not_authorized(
-            "verification execution is not implemented in this build (analysis-only, ADR-008)",
-        )),
+        Command::Policies { command } => match command {
+            PoliciesCommand::List => cmd_policies_list(&data_dir, cli.json).await,
+            PoliciesCommand::Show { name } => cmd_policies_show(&data_dir, name, cli.json).await,
+        },
         Command::Eval { .. } => Err(CccError::invalid_request(
             "evaluation is not implemented in this build",
         )),
@@ -288,6 +316,26 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
                 },
                 Command::Export { output, repo } => {
                     cmd_export(&store, repo.as_deref(), output, cli.json).await
+                }
+                Command::Verify {
+                    base,
+                    head,
+                    policy,
+                    format,
+                    repo,
+                } => {
+                    cmd_verify(
+                        &store,
+                        &artifacts,
+                        &data_dir,
+                        repo.as_deref(),
+                        base,
+                        head.as_deref(),
+                        policy,
+                        format,
+                        cli.json,
+                    )
+                    .await
                 }
                 _ => unreachable!("handled above"),
             }
@@ -1017,6 +1065,170 @@ async fn cmd_export(
             evidence.len(),
             bundles.len(),
             output.display()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verification + policies (TIS §11, §13.4)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_verify(
+    store: &Arc<SqliteStore>,
+    artifacts: &FsArtifactStore,
+    data_dir: &std::path::Path,
+    repo_path: Option<&std::path::Path>,
+    base: &str,
+    head: Option<&str>,
+    policy_name: &str,
+    format: &str,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let root = PathBuf::from(&repo.root_path);
+    let cfg = ccc_config::load_config(data_dir)?;
+    // Policies come only from the data dir; an unknown name is INVALID_REQUEST
+    // (no silent fallback, no false availability).
+    let policy = ccc_verification::load_policy(data_dir, policy_name)?;
+
+    // Idempotency: same repository + patch + policy replays one logical job.
+    let head_commit = GitCli.rev_parse_head(&root)?.unwrap_or_default();
+    let dirty = !GitCli.status_porcelain(&root)?.is_empty();
+    let key = jobs::idempotency_key(&[
+        "verify",
+        &repo.repository_id.to_string(),
+        base,
+        head.unwrap_or("working_tree"),
+        policy_name,
+        &policy.hash(),
+        &head_commit,
+        &format!("{dirty}"),
+    ]);
+    let job = jobs::begin_job(&**store, repo.repository_id, "verify", &key, None).await?;
+
+    let engine = ccc_verification::VerificationEngine::new(
+        &**store,
+        &**store,
+        &**store,
+        &**store,
+        artifacts,
+        &GitCli,
+        cfg.indexing().traversal_depth,
+    );
+    match engine.verify(&repo, &root, base, head, &policy).await {
+        Ok(report) => {
+            let payload = serde_json::json!({
+                "verification_id": report.verification_id,
+                "statuses": report.statuses,
+            });
+            let _job = if job.state.is_terminal() {
+                // Idempotent replay: the logical job already completed.
+                job
+            } else {
+                jobs::finish_success(&**store, job, Some(&payload.to_string())).await?
+            };
+            match (format, json) {
+                (_, true) => print_json(&envelope(&report, meta_for(&repo, None, None))?)?,
+                ("markdown", false) => {
+                    print!(
+                        "{}",
+                        ccc_verification::render_verification_markdown(&report)
+                    )
+                }
+                _ => print_json(&envelope(&report, meta_for(&repo, None, None))?)?,
+            }
+            Ok(())
+        }
+        Err(e) => {
+            jobs::finish_failure(&**store, job, &e).await?;
+            Err(e)
+        }
+    }
+}
+
+async fn cmd_policies_list(data_dir: &std::path::Path, json: bool) -> Result<(), CccError> {
+    let mut policies = Vec::new();
+    for name in ccc_verification::list_policy_names(data_dir) {
+        // Every listed policy is loadable by construction; load it to surface
+        // its hash and execution posture (no false availability).
+        let policy = ccc_verification::load_policy(data_dir, &name)?;
+        policies.push(serde_json::json!({
+            "name": policy.name,
+            "allow_execution": policy.allow_execution,
+            "policy_hash": policy.hash(),
+        }));
+    }
+    if json {
+        print_json(&envelope(&policies, EnvelopeMeta::default())?)?;
+    } else {
+        if policies.len() == 1 {
+            println!("1 policy available (source: data dir; repository content can never define policies):");
+        } else {
+            println!("{} policies available (source: data dir; repository content can never define policies):", policies.len());
+        }
+        for p in &policies {
+            println!(
+                "{} — execution: {}, hash: {}",
+                p["name"].as_str().unwrap_or_default(),
+                if p["allow_execution"].as_bool().unwrap_or(false) {
+                    "allowed (allowlisted commands only)"
+                } else {
+                    "not allowed (analysis-only)"
+                },
+                p["policy_hash"].as_str().unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_policies_show(
+    data_dir: &std::path::Path,
+    name: &str,
+    json: bool,
+) -> Result<(), CccError> {
+    let policy = ccc_verification::load_policy(data_dir, name)?;
+    let doc = serde_json::json!({
+        "name": policy.name,
+        "allow_execution": policy.allow_execution,
+        "allowlist": policy.allowlist,
+        "disallowlist": policy.disallowlist,
+        "timeout_secs": policy.timeout_secs,
+        "max_output_bytes": policy.max_output_bytes,
+        "env_allowlist": policy.env_allowlist,
+        "revalidate_claims": policy.revalidate_claims,
+        "policy_hash": policy.hash(),
+        "source": data_dir.join("policies").join(format!("{name}.toml")).to_string_lossy(),
+    });
+    if json {
+        print_json(&envelope(&doc, EnvelopeMeta::default())?)?;
+    } else {
+        println!(
+            "Policy {} — execution: {}, hash: {}",
+            policy.name,
+            if policy.allow_execution {
+                "allowed (allowlisted commands only)"
+            } else {
+                "not allowed (analysis-only)"
+            },
+            policy.hash()
+        );
+        println!("  allowlist: {:?}", policy.allowlist);
+        println!("  disallowlist: {:?}", policy.disallowlist);
+        println!(
+            "  timeout: {}s, output cap: {} bytes",
+            policy.timeout_secs, policy.max_output_bytes
+        );
+        println!("  env allowlist: {:?}", policy.env_allowlist);
+        println!(
+            "  claim revalidation: {}",
+            if policy.revalidate_claims {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
     }
     Ok(())

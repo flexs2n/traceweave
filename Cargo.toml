@@ -13,6 +13,7 @@ members = [
     "crates/ccc-evidence",
     "crates/ccc-context-compiler",
     "crates/ccc-impact",
+    "crates/ccc-verification",
     "crates/ccc-jobs",
     "crates/ccc-cli",
 ]
@@ -35,6 +36,7 @@ ccc-search = { path = "crates/ccc-search" }
 ccc-evidence = { path = "crates/ccc-evidence" }
 ccc-context-compiler = { path = "crates/ccc-context-compiler" }
 ccc-impact = { path = "crates/ccc-impact" }
+ccc-verification = { path = "crates/ccc-verification" }
 ccc-jobs = { path = "crates/ccc-jobs" }
 
 serde = { version = "1", features = ["derive"] }

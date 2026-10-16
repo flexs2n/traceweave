@@ -1140,6 +1140,33 @@ impl EvidenceStore for SqliteStore {
         tx.commit().await.map_err(db_err)?;
         Ok(updated)
     }
+
+    async fn update_claim_validation(
+        &self,
+        claim_id: ClaimId,
+        status: ClaimStatus,
+        validated_at: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<bool> {
+        // Terminal claims (superseded/retracted) are never revalidated, and
+        // `validated_at` is only written for outcomes that support the claim.
+        let status_str = serde_json::to_string(&status)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+        let result = sqlx::query(
+            "UPDATE claims SET status = ?, validated_at = COALESCE(?, validated_at), updated_at = ? \
+             WHERE claim_id = ? AND status NOT IN ('superseded', 'retracted')",
+        )
+        .bind(&status_str)
+        .bind(validated_at)
+        .bind(updated_at)
+        .bind(claim_id.to_string())
+        .execute(&self.writer)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 fn row_to_claim(row: &SqliteRow) -> StoreResult<ClaimRecord> {
@@ -1439,6 +1466,251 @@ fn row_to_impact(row: &SqliteRow) -> StoreResult<ImpactRecord> {
     })
 }
 
+fn verification_mode_from(s: &str) -> VerificationMode {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .unwrap_or(VerificationMode::Analysis)
+}
+
+fn check_status_from(s: &str) -> VerificationStatus {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .unwrap_or(VerificationStatus::NotRun)
+}
+
+#[async_trait::async_trait]
+impl VerificationStore for SqliteStore {
+    async fn insert_verification(
+        &self,
+        record: &VerificationRecord,
+        checks: &[VerificationCheckRecord],
+    ) -> StoreResult<()> {
+        // One transaction: a record never exists without its check rows
+        // (TIS §11.1 step 9 — the published record is the unit of provenance).
+        let mut tx: Tx = self.writer.begin().await.map_err(db_err)?;
+        sqlx::query(
+            "INSERT INTO verification_records (verification_id, repository_id, snapshot_id, base, head, \
+             policy_name, policy_hash, mode, statuses_json, artifact_hash, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.verification_id.to_string())
+        .bind(record.repository_id.to_string())
+        .bind(record.snapshot_id.to_string())
+        .bind(&record.base)
+        .bind(&record.head)
+        .bind(&record.policy_name)
+        .bind(&record.policy_hash)
+        .bind(
+            serde_json::to_string(&record.mode)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+        )
+        .bind(&record.statuses_json)
+        .bind(&record.artifact_hash)
+        .bind(&record.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        for c in checks {
+            sqlx::query(
+                "INSERT INTO verification_checks (check_id, verification_id, position, suggested_command, relation, \
+                 status, exit_code, duration_ms, stdout_ref, stderr_ref, truncated, env_summary_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(c.check_id.to_string())
+            .bind(c.verification_id.to_string())
+            .bind(c.position as i64)
+            .bind(&c.suggested_command)
+            .bind(&c.relation)
+            .bind(c.status.as_str())
+            .bind(c.exit_code)
+            .bind(c.duration_ms.map(|d| d as i64))
+            .bind(c.stdout_ref.clone())
+            .bind(c.stderr_ref.clone())
+            .bind(c.truncated as i64)
+            .bind(&c.env_summary_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn get_verification(
+        &self,
+        id: VerificationId,
+    ) -> StoreResult<Option<VerificationRecord>> {
+        let row = sqlx::query("SELECT * FROM verification_records WHERE verification_id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.reader)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row_to_verification(&r)).transpose()
+    }
+
+    async fn list_verifications(
+        &self,
+        repository_id: RepositoryId,
+    ) -> StoreResult<Vec<VerificationRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM verification_records WHERE repository_id = ? ORDER BY created_at",
+        )
+        .bind(repository_id.to_string())
+        .fetch_all(&self.reader)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_verification).collect()
+    }
+
+    async fn list_verification_checks(
+        &self,
+        verification_id: VerificationId,
+    ) -> StoreResult<Vec<VerificationCheckRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM verification_checks WHERE verification_id = ? ORDER BY position",
+        )
+        .bind(verification_id.to_string())
+        .fetch_all(&self.reader)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.iter().map(row_to_check).collect())
+    }
+}
+
+fn row_to_verification(row: &SqliteRow) -> StoreResult<VerificationRecord> {
+    Ok(VerificationRecord {
+        verification_id: VerificationId::from_str(&string(row, "verification_id"))?,
+        repository_id: RepositoryId::from_str(&string(row, "repository_id"))?,
+        snapshot_id: SnapshotId::from_str(&string(row, "snapshot_id"))?,
+        base: string(row, "base"),
+        head: string(row, "head"),
+        policy_name: string(row, "policy_name"),
+        policy_hash: string(row, "policy_hash"),
+        mode: verification_mode_from(&string(row, "mode")),
+        statuses_json: string(row, "statuses_json"),
+        artifact_hash: string(row, "artifact_hash"),
+        created_at: string(row, "created_at"),
+    })
+}
+
+fn row_to_check(row: &SqliteRow) -> VerificationCheckRecord {
+    VerificationCheckRecord {
+        check_id: VerificationId::from_str(&string(row, "check_id"))
+            .unwrap_or_else(|_| VerificationId::generate()),
+        verification_id: VerificationId::from_str(&string(row, "verification_id"))
+            .unwrap_or_else(|_| VerificationId::generate()),
+        position: i64_or(row, "position", 0) as u32,
+        suggested_command: string(row, "suggested_command"),
+        relation: string(row, "relation"),
+        status: check_status_from(&string(row, "status")),
+        exit_code: row.try_get::<Option<i64>, _>("exit_code").unwrap_or(None),
+        duration_ms: row
+            .try_get::<Option<i64>, _>("duration_ms")
+            .ok()
+            .flatten()
+            .map(|d| d.max(0) as u64),
+        stdout_ref: opt_string(row, "stdout_ref"),
+        stderr_ref: opt_string(row, "stderr_ref"),
+        truncated: i64_or(row, "truncated", 0) != 0,
+        env_summary_json: string(row, "env_summary_json"),
+    }
+}
+
+#[async_trait::async_trait]
+impl EvaluationStore for SqliteStore {
+    async fn insert_suite(&self, record: &EvaluationSuiteRecord) -> StoreResult<()> {
+        // Immutable registry: an identical hash is a no-op (Phase G).
+        sqlx::query(
+            "INSERT OR IGNORE INTO evaluation_suites (suite_hash, name, case_count, suite_json, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&record.suite_hash)
+        .bind(&record.name)
+        .bind(record.case_count as i64)
+        .bind(&record.suite_json)
+        .bind(&record.created_at)
+        .execute(&self.writer)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_suite(&self, suite_hash: &str) -> StoreResult<Option<EvaluationSuiteRecord>> {
+        let row = sqlx::query("SELECT * FROM evaluation_suites WHERE suite_hash = ?")
+            .bind(suite_hash)
+            .fetch_optional(&self.reader)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| {
+            Ok(EvaluationSuiteRecord {
+                suite_hash: string(&r, "suite_hash"),
+                name: string(&r, "name"),
+                case_count: i64_or(&r, "case_count", 0) as u32,
+                suite_json: string(&r, "suite_json"),
+                created_at: string(&r, "created_at"),
+            })
+        })
+        .transpose()
+    }
+
+    async fn insert_run(&self, record: &EvaluationRunRecord) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO evaluation_runs (run_id, repository_id, suite_name, suite_hash, policy_version, \
+             policy_hash, config_hash, metrics_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.run_id.to_string())
+        .bind(record.repository_id.to_string())
+        .bind(&record.suite_name)
+        .bind(&record.suite_hash)
+        .bind(&record.policy_version)
+        .bind(&record.policy_hash)
+        .bind(&record.config_hash)
+        .bind(&record.metrics_json)
+        .bind(&record.created_at)
+        .execute(&self.writer)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_run(&self, id: EvaluationRunId) -> StoreResult<Option<EvaluationRunRecord>> {
+        let row = sqlx::query("SELECT * FROM evaluation_runs WHERE run_id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.reader)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row_to_run(&r)).transpose()
+    }
+
+    async fn list_runs(
+        &self,
+        repository_id: RepositoryId,
+    ) -> StoreResult<Vec<EvaluationRunRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM evaluation_runs WHERE repository_id = ? ORDER BY created_at",
+        )
+        .bind(repository_id.to_string())
+        .fetch_all(&self.reader)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row_to_run).collect()
+    }
+}
+
+fn row_to_run(row: &SqliteRow) -> StoreResult<EvaluationRunRecord> {
+    Ok(EvaluationRunRecord {
+        run_id: EvaluationRunId::from_str(&string(row, "run_id"))?,
+        repository_id: RepositoryId::from_str(&string(row, "repository_id"))?,
+        suite_name: string(row, "suite_name"),
+        suite_hash: string(row, "suite_hash"),
+        policy_version: string(row, "policy_version"),
+        policy_hash: string(row, "policy_hash"),
+        config_hash: string(row, "config_hash"),
+        metrics_json: string(row, "metrics_json"),
+        created_at: string(row, "created_at"),
+    })
+}
+
 #[async_trait::async_trait]
 impl ArtifactStore for SqliteStore {
     async fn put(&self, _bytes: &[u8], _media_type: &str) -> StoreResult<String> {
@@ -1619,15 +1891,204 @@ mod tests {
         // migrations but does not implement revert), then re-apply.
         let migrator = sqlx::migrate!("../../migrations/sqlite");
         let pool = store2.writer_pool().clone();
-        let down_sql = include_str!("../../../migrations/sqlite/manual-down/0001_init_down.sql");
-        for statement in down_sql.split(';') {
-            let stmt = statement.trim();
-            if stmt.is_empty() || stmt.starts_with("--") {
-                continue;
+        for down_file in [
+            include_str!("../../../migrations/sqlite/manual-down/0002_verification_eval_down.sql"),
+            include_str!("../../../migrations/sqlite/manual-down/0001_init_down.sql"),
+        ] {
+            for statement in down_file.split(';') {
+                let stmt = statement.trim();
+                if stmt.is_empty() || stmt.starts_with("--") {
+                    continue;
+                }
+                sqlx::query(stmt).execute(&pool).await.unwrap();
             }
-            sqlx::query(stmt).execute(&pool).await.unwrap();
         }
         migrator.run(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_records_are_fk_enforced_and_checks_queryable() {
+        let (_dir, store) = temp_store().await;
+        let repo = repo_record();
+        store.insert_repository(&repo).await.unwrap();
+        let snapshot = snapshot_record(&repo);
+        store.insert_snapshot(&snapshot).await.unwrap();
+
+        let verification_id = VerificationId::generate();
+        let record = VerificationRecord {
+            verification_id,
+            repository_id: repo.repository_id,
+            snapshot_id: snapshot.snapshot_id,
+            base: "HEAD~1".into(),
+            head: "HEAD".into(),
+            policy_name: "analysis".into(),
+            policy_hash: "policy-hash".into(),
+            mode: VerificationMode::Analysis,
+            statuses_json: r#"{"not_run":2}"#.into(),
+            artifact_hash: "artifact".into(),
+            created_at: now_rfc3339(),
+        };
+        let mk_check = |position: u32, status: VerificationStatus| VerificationCheckRecord {
+            check_id: VerificationId::generate(),
+            verification_id,
+            position,
+            suggested_command: "cargo test".into(),
+            relation: "directly".into(),
+            status,
+            exit_code: None,
+            duration_ms: None,
+            stdout_ref: None,
+            stderr_ref: None,
+            truncated: false,
+            env_summary_json: "{}".into(),
+        };
+        let checks = vec![
+            mk_check(0, VerificationStatus::NotRun),
+            mk_check(1, VerificationStatus::Blocked),
+        ];
+        store.insert_verification(&record, &checks).await.unwrap();
+
+        let fetched = store
+            .get_verification(verification_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.policy_name, "analysis");
+        assert_eq!(fetched.mode, VerificationMode::Analysis);
+        let rows = store
+            .list_verification_checks(verification_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].position, 0);
+        assert_eq!(rows[0].status, VerificationStatus::NotRun);
+        assert_eq!(rows[1].status, VerificationStatus::Blocked);
+
+        // Unknown check statuses never pass silently (TIS §11.3).
+        assert_ne!(rows[0].status, VerificationStatus::Passed);
+
+        // FK: a record referencing an unknown snapshot must be rejected.
+        let bad = VerificationRecord {
+            verification_id: VerificationId::generate(),
+            snapshot_id: SnapshotId::generate(),
+            ..record.clone()
+        };
+        assert!(store.insert_verification(&bad, &[]).await.is_err());
+
+        // A record referencing an unknown repository must be rejected too.
+        let bad_repo = VerificationRecord {
+            verification_id: VerificationId::generate(),
+            repository_id: RepositoryId::generate(),
+            ..record
+        };
+        assert!(store.insert_verification(&bad_repo, &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn evaluation_suites_are_immutable_and_runs_queryable() {
+        let (_dir, store) = temp_store().await;
+        let repo = repo_record();
+        store.insert_repository(&repo).await.unwrap();
+
+        let suite = EvaluationSuiteRecord {
+            suite_hash: "suite-hash-1".into(),
+            name: "fixture".into(),
+            case_count: 2,
+            suite_json: "{\"name\":\"fixture\"}".into(),
+            created_at: now_rfc3339(),
+        };
+        store.insert_suite(&suite).await.unwrap();
+        // Re-recording an identical hash is a no-op (immutable registry).
+        let mut renamed = suite.clone();
+        renamed.case_count = 99;
+        store.insert_suite(&renamed).await.unwrap();
+        let stored = store.get_suite("suite-hash-1").await.unwrap().unwrap();
+        assert_eq!(stored.case_count, 2);
+
+        let run = EvaluationRunRecord {
+            run_id: EvaluationRunId::generate(),
+            repository_id: repo.repository_id,
+            suite_name: "fixture".into(),
+            suite_hash: "suite-hash-1".into(),
+            policy_version: "policy-v1".into(),
+            policy_hash: "policy-hash".into(),
+            config_hash: "config-hash".into(),
+            metrics_json: "{\"recall_millis\":1000}".into(),
+            created_at: now_rfc3339(),
+        };
+        store.insert_run(&run).await.unwrap();
+        let runs = store.list_runs(repo.repository_id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run.run_id);
+        assert_eq!(runs[0].policy_version, "policy-v1");
+        let fetched = store.get_run(run.run_id).await.unwrap().unwrap();
+        assert_eq!(fetched.metrics_json, run.metrics_json);
+
+        // FK: runs must reference a recorded suite hash.
+        let bad = EvaluationRunRecord {
+            suite_hash: "unknown-suite".into(),
+            ..run.clone()
+        };
+        assert!(store.insert_run(&bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn claim_validation_updates_respect_terminal_states() {
+        let (_dir, store) = temp_store().await;
+        let repo = repo_record();
+        store.insert_repository(&repo).await.unwrap();
+        let snapshot = snapshot_record(&repo);
+        store.insert_snapshot(&snapshot).await.unwrap();
+        let claim = ClaimRecord {
+            claim_id: ClaimId::generate(),
+            repository_id: repo.repository_id,
+            snapshot_id: snapshot.snapshot_id,
+            claim_type: "symbol_existence".into(),
+            text: "claim".into(),
+            status: ClaimStatus::Stale,
+            source_kind: "extracted".into(),
+            confidence_category: ConfidenceCategory::Unverified,
+            created_at: now_rfc3339(),
+            validated_at: None,
+            updated_at: now_rfc3339(),
+        };
+        store
+            .insert_claims(std::slice::from_ref(&claim))
+            .await
+            .unwrap();
+
+        let validated = now_rfc3339();
+        let ok = store
+            .update_claim_validation(
+                claim.claim_id,
+                ClaimStatus::Supported,
+                Some(&validated),
+                &validated,
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+        let updated = store.get_claim(claim.claim_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, ClaimStatus::Supported);
+        assert_eq!(updated.validated_at.as_deref(), Some(validated.as_str()));
+
+        // Retracted claims are terminal and never re-touched.
+        store
+            .update_claim_validation(claim.claim_id, ClaimStatus::Retracted, None, &validated)
+            .await
+            .unwrap();
+        let untouched = store
+            .update_claim_validation(
+                claim.claim_id,
+                ClaimStatus::Supported,
+                Some(&validated),
+                &validated,
+            )
+            .await
+            .unwrap();
+        assert!(!untouched);
+        let final_claim = store.get_claim(claim.claim_id).await.unwrap().unwrap();
+        assert_eq!(final_claim.status, ClaimStatus::Retracted);
     }
 
     #[tokio::test]

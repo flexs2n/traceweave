@@ -628,6 +628,32 @@ impl EvidenceStore for InMemoryEvidenceStore {
         }
         Ok(updated)
     }
+
+    async fn update_claim_validation(
+        &self,
+        claim_id: ClaimId,
+        status: ClaimStatus,
+        validated_at: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.claims.iter_mut().find(|c| c.claim_id == claim_id) {
+            Some(claim)
+                if !matches!(
+                    claim.status,
+                    ClaimStatus::Superseded | ClaimStatus::Retracted
+                ) =>
+            {
+                claim.status = status;
+                if let Some(at) = validated_at {
+                    claim.validated_at = Some(at.to_string());
+                }
+                claim.updated_at = updated_at.to_string();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 /// In-memory [`JobStore`].
@@ -787,10 +813,160 @@ impl ImpactStore for InMemoryImpactStore {
     }
 }
 
+/// In-memory [`VerificationStore`].
+#[derive(Default)]
+pub struct InMemoryVerificationStore {
+    inner: Mutex<VerificationInner>,
+}
+
+#[derive(Default)]
+struct VerificationInner {
+    records: Vec<VerificationRecord>,
+    checks: Vec<VerificationCheckRecord>,
+}
+
+impl InMemoryVerificationStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl VerificationStore for InMemoryVerificationStore {
+    async fn insert_verification(
+        &self,
+        record: &VerificationRecord,
+        checks: &[VerificationCheckRecord],
+    ) -> StoreResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.records.push(record.clone());
+        inner.checks.extend(checks.iter().cloned());
+        Ok(())
+    }
+
+    async fn get_verification(
+        &self,
+        id: VerificationId,
+    ) -> StoreResult<Option<VerificationRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .records
+            .iter()
+            .find(|r| r.verification_id == id)
+            .cloned())
+    }
+
+    async fn list_verifications(
+        &self,
+        repository_id: RepositoryId,
+    ) -> StoreResult<Vec<VerificationRecord>> {
+        let inner = self.inner.lock().unwrap();
+        let mut records: Vec<VerificationRecord> = inner
+            .records
+            .iter()
+            .filter(|r| r.repository_id == repository_id)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(records)
+    }
+
+    async fn list_verification_checks(
+        &self,
+        verification_id: VerificationId,
+    ) -> StoreResult<Vec<VerificationCheckRecord>> {
+        let inner = self.inner.lock().unwrap();
+        let mut checks: Vec<VerificationCheckRecord> = inner
+            .checks
+            .iter()
+            .filter(|c| c.verification_id == verification_id)
+            .cloned()
+            .collect();
+        checks.sort_by_key(|c| c.position);
+        Ok(checks)
+    }
+}
+
+/// In-memory [`EvaluationStore`].
+#[derive(Default)]
+pub struct InMemoryEvaluationStore {
+    inner: Mutex<EvaluationInner>,
+}
+
+#[derive(Default)]
+struct EvaluationInner {
+    suites: Vec<EvaluationSuiteRecord>,
+    runs: Vec<EvaluationRunRecord>,
+}
+
+impl InMemoryEvaluationStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl EvaluationStore for InMemoryEvaluationStore {
+    async fn insert_suite(&self, record: &EvaluationSuiteRecord) -> StoreResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner
+            .suites
+            .iter()
+            .any(|s| s.suite_hash == record.suite_hash)
+        {
+            inner.suites.push(record.clone());
+        }
+        Ok(())
+    }
+
+    async fn get_suite(&self, suite_hash: &str) -> StoreResult<Option<EvaluationSuiteRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .suites
+            .iter()
+            .find(|s| s.suite_hash == suite_hash)
+            .cloned())
+    }
+
+    async fn insert_run(&self, record: &EvaluationRunRecord) -> StoreResult<()> {
+        self.inner.lock().unwrap().runs.push(record.clone());
+        Ok(())
+    }
+
+    async fn get_run(&self, id: EvaluationRunId) -> StoreResult<Option<EvaluationRunRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .runs
+            .iter()
+            .find(|r| r.run_id == id)
+            .cloned())
+    }
+
+    async fn list_runs(
+        &self,
+        repository_id: RepositoryId,
+    ) -> StoreResult<Vec<EvaluationRunRecord>> {
+        let inner = self.inner.lock().unwrap();
+        let mut runs: Vec<EvaluationRunRecord> = inner
+            .runs
+            .iter()
+            .filter(|r| r.repository_id == repository_id)
+            .cloned()
+            .collect();
+        runs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(runs)
+    }
+}
+
 /// In-memory [`ArtifactStore`] (kept in process memory).
 #[derive(Default)]
 pub struct InMemoryArtifactStore(Mutex<HashMap<String, (Vec<u8>, ArtifactMeta)>>);
-
 impl InMemoryArtifactStore {
     pub fn new() -> Self {
         Self::default()

@@ -201,6 +201,73 @@ pub enum ChangeKind {
     Renamed,
 }
 
+/// Terminal status of one verification check (TIS §11.3). The vocabulary is
+/// exact; a check that was skipped, could not start, or produced an ambiguous
+/// result is never reported as `passed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Passed,
+    Failed,
+    TimedOut,
+    Blocked,
+    NotRun,
+    Unavailable,
+    Cancelled,
+}
+
+impl VerificationStatus {
+    /// The canonical serialized form used in records and CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerificationStatus::Passed => "passed",
+            VerificationStatus::Failed => "failed",
+            VerificationStatus::TimedOut => "timed_out",
+            VerificationStatus::Blocked => "blocked",
+            VerificationStatus::NotRun => "not_run",
+            VerificationStatus::Unavailable => "unavailable",
+            VerificationStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Verification mode (SDD §15.1). Modes 1–2 execute nothing; mode 3 requires
+/// an explicit non-`analysis` policy. Modes 4 (external import) and 5 (human
+/// review) are later-step extensions and deliberately absent here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationMode {
+    /// Static inspection of the patch and its affected relationships.
+    Analysis,
+    /// Checks are recommended but not executed.
+    Suggested,
+    /// Approved commands run under the policy's execution environment.
+    Authorized,
+}
+
+/// Why a selected test relates to the change (SDD §15.2). A selected test set
+/// is a recommendation, not proof that every regression path is covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRelation {
+    Directly,
+    Transitively,
+    Historically,
+    Fallback,
+}
+
+impl TestRelation {
+    /// The canonical serialized form used in records and CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TestRelation::Directly => "directly",
+            TestRelation::Transitively => "transitively",
+            TestRelation::Historically => "historically",
+            TestRelation::Fallback => "fallback",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +361,47 @@ mod tests {
         ));
         assert!(JobState::Succeeded.is_terminal());
         assert!(!JobState::Running.is_terminal());
+    }
+
+    #[test]
+    fn verification_statuses_serialize_per_tis_vocabulary() {
+        let expected = [
+            (VerificationStatus::Passed, "\"passed\""),
+            (VerificationStatus::Failed, "\"failed\""),
+            (VerificationStatus::TimedOut, "\"timed_out\""),
+            (VerificationStatus::Blocked, "\"blocked\""),
+            (VerificationStatus::NotRun, "\"not_run\""),
+            (VerificationStatus::Unavailable, "\"unavailable\""),
+            (VerificationStatus::Cancelled, "\"cancelled\""),
+        ];
+        for (status, json) in expected {
+            assert_eq!(serde_json::to_string(&status).unwrap(), json);
+            let back: VerificationStatus = serde_json::from_str(json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn verification_modes_and_test_relations_round_trip() {
+        for mode in [
+            VerificationMode::Analysis,
+            VerificationMode::Suggested,
+            VerificationMode::Authorized,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: VerificationMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+        for relation in [
+            TestRelation::Directly,
+            TestRelation::Transitively,
+            TestRelation::Historically,
+            TestRelation::Fallback,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&relation).unwrap(),
+                format!("\"{}\"", relation.as_str())
+            );
+        }
     }
 }

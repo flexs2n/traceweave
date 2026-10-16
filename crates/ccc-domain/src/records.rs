@@ -231,6 +231,81 @@ pub struct ImpactRecord {
     pub created_at: String,
 }
 
+/// An immutable verification record (TIS §11.1 step 9, §11.3): identifies the
+/// exact snapshot, policy (name + hash), mode, and per-status summary. Check
+/// details live in [`VerificationCheckRecord`] rows; command output lives in
+/// the artifact store (refs, never inline).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerificationRecord {
+    pub verification_id: VerificationId,
+    pub repository_id: RepositoryId,
+    pub snapshot_id: SnapshotId,
+    pub base: String,
+    pub head: String,
+    /// Policy file name without extension (e.g. `analysis`).
+    pub policy_name: String,
+    /// BLAKE3 over the canonical serialization of the effective policy.
+    pub policy_hash: String,
+    pub mode: VerificationMode,
+    /// Per-status counts over the record's checks (serialized JSON object:
+    /// status string → count). Summary only — check rows are authoritative.
+    pub statuses_json: String,
+    pub artifact_hash: String,
+    pub created_at: String,
+}
+
+/// One check row of a verification record (queryable, TIS §11.3). Output is
+/// stored as capped blob artifacts referenced by `stdout_ref`/`stderr_ref`;
+/// truncation is flagged, never silent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerificationCheckRecord {
+    pub check_id: VerificationId,
+    pub verification_id: VerificationId,
+    pub position: u32,
+    /// The command (or analysis suggestion) this check corresponds to.
+    pub suggested_command: String,
+    /// `directly` | `transitively` | `historically` | `fallback` (SDD §15.2),
+    /// or `directly` for static-analysis entries.
+    pub relation: String,
+    pub status: VerificationStatus,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<u64>,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
+    /// `true` when stored output was capped at the policy limit.
+    pub truncated: bool,
+    /// Minimal environment summary actually applied (allowlisted names only).
+    pub env_summary_json: String,
+}
+
+/// A stored evaluation suite: immutable once recorded; the hash is the key
+/// (SDD Phase G).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationSuiteRecord {
+    /// BLAKE3 over the suite file bytes.
+    pub suite_hash: String,
+    pub name: String,
+    pub case_count: u32,
+    /// Canonical JSON of the parsed suite document.
+    pub suite_json: String,
+    pub created_at: String,
+}
+
+/// An immutable evaluation run record (SDD §20.2, TIS §19.5). Runs with
+/// identical (suite, policy, config) inputs produce identical `metrics_json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationRunRecord {
+    pub run_id: EvaluationRunId,
+    pub repository_id: RepositoryId,
+    pub suite_name: String,
+    pub suite_hash: String,
+    pub policy_version: String,
+    pub policy_hash: String,
+    pub config_hash: String,
+    pub metrics_json: String,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -95,6 +95,14 @@ define_id!(
     /// Identifier of a change-impact report.
     ImpactId
 );
+define_id!(
+    /// Identifier of an immutable verification record.
+    VerificationId
+);
+define_id!(
+    /// Identifier of an immutable evaluation run record.
+    EvaluationRunId
+);
 
 #[cfg(test)]
 mod tests {

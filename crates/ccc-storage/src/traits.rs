@@ -183,6 +183,17 @@ pub trait EvidenceStore: Send + Sync {
         claim_ids: &[ClaimId],
         updated_at: &str,
     ) -> StoreResult<Vec<ClaimId>>;
+    /// Applies a verification outcome to one claim (SDD §15.6): sets the
+    /// status, `validated_at` (when the outcome supports the claim) and
+    /// `updated_at`. Returns `false` when the claim does not exist; claims in
+    /// terminal states (`superseded`, `retracted`) are never touched.
+    async fn update_claim_validation(
+        &self,
+        claim_id: ClaimId,
+        status: ClaimStatus,
+        validated_at: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<bool>;
 }
 
 /// Job records (TIS §15.1).
@@ -219,6 +230,43 @@ pub trait ImpactStore: Send + Sync {
     async fn insert_impact(&self, record: &ImpactRecord) -> StoreResult<()>;
     async fn get_impact(&self, id: ImpactId) -> StoreResult<Option<ImpactRecord>>;
     async fn list_impacts(&self, repository_id: RepositoryId) -> StoreResult<Vec<ImpactRecord>>;
+}
+
+/// Immutable verification records and their check rows (TIS §11).
+#[async_trait::async_trait]
+pub trait VerificationStore: Send + Sync {
+    /// Publishes one record with its checks in a single transaction. The
+    /// record is immutable once written.
+    async fn insert_verification(
+        &self,
+        record: &VerificationRecord,
+        checks: &[VerificationCheckRecord],
+    ) -> StoreResult<()>;
+    async fn get_verification(&self, id: VerificationId)
+        -> StoreResult<Option<VerificationRecord>>;
+    async fn list_verifications(
+        &self,
+        repository_id: RepositoryId,
+    ) -> StoreResult<Vec<VerificationRecord>>;
+    /// Check rows of a record, ordered by position.
+    async fn list_verification_checks(
+        &self,
+        verification_id: VerificationId,
+    ) -> StoreResult<Vec<VerificationCheckRecord>>;
+}
+
+/// Evaluation suite registry (hash-keyed, immutable) and run records
+/// (SDD §20.2, Phase G).
+#[async_trait::async_trait]
+pub trait EvaluationStore: Send + Sync {
+    /// Records a suite by content hash; re-recording an identical suite is a
+    /// no-op (suites are immutable — a changed file is a new hash).
+    async fn insert_suite(&self, record: &EvaluationSuiteRecord) -> StoreResult<()>;
+    async fn get_suite(&self, suite_hash: &str) -> StoreResult<Option<EvaluationSuiteRecord>>;
+    async fn insert_run(&self, record: &EvaluationRunRecord) -> StoreResult<()>;
+    async fn get_run(&self, id: EvaluationRunId) -> StoreResult<Option<EvaluationRunRecord>>;
+    async fn list_runs(&self, repository_id: RepositoryId)
+        -> StoreResult<Vec<EvaluationRunRecord>>;
 }
 
 /// Content-addressed artifact metadata row (TIS §5.4).

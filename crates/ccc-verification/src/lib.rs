@@ -14,6 +14,7 @@
 
 pub mod executor;
 pub mod policy;
+pub mod revalidate;
 pub mod select;
 
 use ccc_domain::*;
@@ -93,6 +94,9 @@ pub struct VerificationReportDto {
     /// Observed-vs-predicted comparison notes (TIS §11.1 step 8). Surfaced
     /// for human judgment — never used to auto-accept a patch (SDD §15.5).
     pub observed_vs_predicted: Vec<String>,
+    /// Evidence revalidation outcome (TIS §11.1 step 10, SDD §15.6): scoped
+    /// claim flips with their provenance links.
+    pub revalidation: revalidate::RevalidationSummary,
     pub limitations: Vec<String>,
     pub created_at: String,
 }
@@ -186,6 +190,9 @@ impl<'a> VerificationEngine<'a> {
                     candidate,
                     &verification_id,
                     position as u32,
+                    // No interactive cancellation surface in the Step 2 CLI;
+                    // the seam exists for job cancellation (SDD §15.3).
+                    None,
                 )
                 .await?;
                 (dto, record)
@@ -236,6 +243,20 @@ impl<'a> VerificationEngine<'a> {
             .compare_with_prior(repo.repository_id, &impact.changed_symbols)
             .await?;
 
+        // Step 10: scoped evidence revalidation (SDD §15.6). Analysis runs
+        // have no completed checks, so this is an explicit no-op with a note.
+        let revalidation = revalidate::revalidate(revalidate::RevalidationInput {
+            evidence: self.evidence,
+            repository_id: repo.repository_id,
+            verification_id,
+            policy_name: &policy.name,
+            policy_allows_revalidation: policy.revalidate_claims,
+            scope_file_ids: &changed.file_ids,
+            scope_symbol_ids: &changed.symbol_ids,
+            checks: &checks,
+        })
+        .await?;
+
         let mut newly_stale_claims: Vec<String> = impact
             .affected_claims
             .iter()
@@ -283,6 +304,7 @@ impl<'a> VerificationEngine<'a> {
             checks,
             statuses,
             observed_vs_predicted,
+            revalidation,
             limitations,
             created_at: now_rfc3339(),
         };
@@ -537,6 +559,29 @@ pub fn render_verification_markdown(report: &VerificationReportDto) -> String {
         for id in &report.newly_stale_claims {
             out.push_str(&format!("- `{id}`\n"));
         }
+    }
+    out.push_str("\n## Evidence revalidation (scoped, SDD §15.6)\n\n");
+    if !report.revalidation.supported_claims.is_empty() {
+        out.push_str(&format!(
+            "- supported: {} claim(s) now carry `validated_at` + this record's link\n",
+            report.revalidation.supported_claims.len()
+        ));
+    }
+    if !report.revalidation.conflicted_claims.is_empty() {
+        out.push_str(&format!(
+            "- conflicted: {} claim(s) marked by failing checks (negative results preserved)\n",
+            report.revalidation.conflicted_claims.len()
+        ));
+    }
+    if report.revalidation.ambiguous {
+        out.push_str(&format!(
+            "- no claim was touched: {} (ambiguous outcomes establish nothing)\n",
+            if report.revalidation.note.is_empty() {
+                "outcome not established".to_string()
+            } else {
+                report.revalidation.note.clone()
+            }
+        ));
     }
     out.push_str("\n## Limitations\n\n");
     for l in &report.limitations {
@@ -960,6 +1005,231 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("unverified by execution")),
             "analysis mode is explicit that predictions are unverified"
+        );
+    }
+
+    // -- T4: evidence revalidation with a real cargo project ----------------
+
+    const CARGO_TOML: &str = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n";
+    const GITIGNORE: &str = "/target\nCargo.lock\n";
+
+    /// Fixture that is a real cargo project so authorized `cargo build` works.
+    async fn setup_cargo() -> Fixture {
+        let guard = tempfile::tempdir().unwrap();
+        let root = guard.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        run(&root, &["init", "--initial-branch=main"]);
+        run(&root, &["config", "user.email", "t@e.com"]);
+        run(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("Cargo.toml"), CARGO_TOML).unwrap();
+        std::fs::write(root.join(".gitignore"), GITIGNORE).unwrap();
+        std::fs::write(root.join("src/lib.rs"), LIB_V1).unwrap();
+        std::fs::write(root.join("src/util.rs"), UTIL_V1).unwrap();
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-m", "base"]);
+
+        let store = Arc::new(
+            SqliteStore::connect(&guard.path().join("ccc.db"))
+                .await
+                .unwrap(),
+        );
+        let artifacts = FsArtifactStore::new(guard.path().join("blobs"), store.clone());
+        let registry = ccc_repository::RepositoryRegistry::new(&*store, &GitCli);
+        let cfg = IndexingConfig::default();
+        let repo = registry
+            .register(&root, &cfg.configuration_hash().unwrap())
+            .await
+            .unwrap();
+        index_current(&store, &artifacts, &repo, &cfg, &root).await;
+        Fixture {
+            _guard: guard,
+            root,
+            store,
+            artifacts,
+            repo,
+            cfg,
+        }
+    }
+
+    fn cargo_policy() -> VerificationPolicy {
+        VerificationPolicy {
+            name: "local-build".into(),
+            allow_execution: true,
+            allowlist: vec!["cargo".into()],
+            disallowlist: vec![],
+            timeout_secs: 300,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            env_allowlist: vec!["PATH".into(), "CARGO_HOME".into(), "RUSTUP_HOME".into()],
+            revalidate_claims: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_pass_revalidates_covered_claims_scoped() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let fx = setup_cargo().await;
+        // Patch util.rs, commit, reindex: old claims go stale, the active
+        // generation gains fresh candidate claims.
+        std::fs::write(
+            fx.root.join("src/util.rs"),
+            "pub fn read_config() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        run(&fx.root, &["add", "-A"]);
+        run(&fx.root, &["commit", "-m", "change util"]);
+        index_current(&fx.store, &fx.artifacts, &fx.repo, &fx.cfg, &fx.root).await;
+
+        let verifications = ccc_storage::test_support::InMemoryVerificationStore::new();
+        let git = StubGit {
+            entries: util_modified(),
+        };
+        let report = engine(&fx, &git, &verifications)
+            .verify(&fx.repo, &fx.root, "HEAD~1", Some("HEAD"), &cargo_policy())
+            .await
+            .unwrap();
+
+        // cargo build + the selected checks actually ran and passed.
+        assert_eq!(report.mode, VerificationMode::Authorized);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.command == "cargo build" && c.status == "passed"),
+            "cargo build executed and passed: {:?}",
+            report.checks
+        );
+        assert!(
+            report.checks.iter().all(|c| c.status == "passed"),
+            "nothing skipped under the covering allowlist: {:?}",
+            report.checks
+        );
+
+        // Covered claims (active generation, util.rs) are now supported with
+        // validated_at; unrelated claims (lib.rs) are untouched candidates.
+        let claims = fx.store.list_claims(fx.repo.repository_id).await.unwrap();
+        let util_claims: Vec<&ClaimRecord> = claims
+            .iter()
+            .filter(|c| c.text.contains("read_config") && c.status == ClaimStatus::Supported)
+            .collect();
+        assert!(
+            !util_claims.is_empty(),
+            "at least one util.rs claim became supported"
+        );
+        for claim in &util_claims {
+            assert!(claim.validated_at.is_some(), "validated_at recorded");
+        }
+        // The verification link chains via evidence rows (type verification).
+        let evidence = fx.store.list_evidence(fx.repo.repository_id).await.unwrap();
+        let links: Vec<&EvidenceRecord> = evidence
+            .iter()
+            .filter(|e| {
+                e.evidence_type == EvidenceType::Verification
+                    && e.source_ref
+                        .starts_with(&format!("verification:{}", report.verification_id))
+            })
+            .collect();
+        assert!(
+            links.len() >= util_claims.len(),
+            "each supported claim chains to the verification record"
+        );
+        assert!(links
+            .iter()
+            .all(|e| e.validation_outcome.as_deref() == Some("passed")));
+
+        // Scoped: claims that depend only on lib.rs stay candidates.
+        let lib_claims: Vec<&ClaimRecord> = claims
+            .iter()
+            .filter(|c| c.text.contains("run_app"))
+            .collect();
+        assert!(
+            lib_claims
+                .iter()
+                .all(|c| c.status == ClaimStatus::Candidate),
+            "unrelated claims are untouched by the verified change: {:?}",
+            lib_claims.iter().map(|c| c.status).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_check_conflicts_claims_and_negatives_survive_a_later_pass() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let fx = setup_cargo().await;
+        // Broken patch: util.rs no longer compiles.
+        std::fs::write(
+            fx.root.join("src/util.rs"),
+            "pub fn read_config() -> u8 { absolutely_not_defined(); }\n",
+        )
+        .unwrap();
+        run(&fx.root, &["add", "-A"]);
+        run(&fx.root, &["commit", "-m", "broken change"]);
+        index_current(&fx.store, &fx.artifacts, &fx.repo, &fx.cfg, &fx.root).await;
+
+        let verifications = ccc_storage::test_support::InMemoryVerificationStore::new();
+        let git = StubGit {
+            entries: util_modified(),
+        };
+        let failed = engine(&fx, &git, &verifications)
+            .verify(&fx.repo, &fx.root, "HEAD~1", Some("HEAD"), &cargo_policy())
+            .await
+            .unwrap();
+        assert!(failed.statuses.get("failed").is_some_and(|n| *n >= 1));
+        assert_eq!(failed.statuses.get("passed"), Some(&0));
+        assert!(
+            !failed.revalidation.conflicted_claims.is_empty(),
+            "covered claims are conflicted by the failing check"
+        );
+        let claims = fx.store.list_claims(fx.repo.repository_id).await.unwrap();
+        assert!(claims
+            .iter()
+            .any(|c| c.text.contains("read_config") && c.status == ClaimStatus::Conflicted));
+
+        // The negative result is an evidence row with outcome failed.
+        let evidence_count_failed = fx
+            .store
+            .list_evidence(fx.repo.repository_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.validation_outcome.as_deref() == Some("failed"))
+            .count();
+        assert!(evidence_count_failed > 0, "negative results are recorded");
+
+        // Repair: a later pass revalidates the covered claims...
+        std::fs::write(
+            fx.root.join("src/util.rs"),
+            "pub fn read_config() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        run(&fx.root, &["add", "-A"]);
+        run(&fx.root, &["commit", "-m", "fix util"]);
+        index_current(&fx.store, &fx.artifacts, &fx.repo, &fx.cfg, &fx.root).await;
+        let git = StubGit {
+            entries: util_modified(),
+        };
+        let repaired = engine(&fx, &git, &verifications)
+            .verify(&fx.repo, &fx.root, "HEAD~1", Some("HEAD"), &cargo_policy())
+            .await
+            .unwrap();
+        assert!(repaired.statuses.get("passed").is_some_and(|n| *n >= 1));
+        assert!(!repaired.revalidation.supported_claims.is_empty());
+
+        // ...and the earlier failed verification record stays queryable.
+        let records = verifications
+            .list_verifications(fx.repo.repository_id)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2, "both runs are recorded immutably");
+        let negatives = fx
+            .store
+            .list_evidence(fx.repo.repository_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.validation_outcome.as_deref() == Some("failed"))
+            .count();
+        assert_eq!(
+            negatives, evidence_count_failed,
+            "negative evidence rows are preserved after a later pass"
         );
     }
 }

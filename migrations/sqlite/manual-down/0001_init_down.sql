@@ -1,0 +1,19 @@
+-- 0001_init_down.sql — reverse of 0001_init_up.sql.
+DROP TABLE IF EXISTS impact_reports;
+DROP TABLE IF EXISTS bundle_items;
+DROP TABLE IF EXISTS context_bundles;
+DROP TABLE IF EXISTS claim_dependencies;
+DROP TABLE IF EXISTS evidence;
+DROP TABLE IF EXISTS claims;
+DROP TABLE IF EXISTS jobs;
+DROP TABLE IF EXISTS parse_cache;
+DROP TABLE IF EXISTS artifacts;
+DROP TABLE IF EXISTS repository_state;
+DROP TABLE IF EXISTS index_generations;
+DROP TABLE IF EXISTS dependency_edges;
+DROP TABLE IF EXISTS "references";
+DROP TABLE IF EXISTS symbols;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS snapshots;
+DROP TABLE IF EXISTS repositories;
+DROP TABLE IF EXISTS search_fts;

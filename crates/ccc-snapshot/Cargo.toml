@@ -1,0 +1,18 @@
+[package]
+name = "ccc-snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ccc-domain = { workspace = true }
+ccc-repository = { workspace = true }
+ccc-storage = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+ccc-storage = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

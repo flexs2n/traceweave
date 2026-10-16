@@ -1,0 +1,14 @@
+[package]
+name = "ccc-tree-sitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ccc-domain = { workspace = true }
+serde = { workspace = true }
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
+
+[lints]
+workspace = true

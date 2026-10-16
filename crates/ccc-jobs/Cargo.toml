@@ -1,0 +1,15 @@
+[package]
+name = "ccc-jobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ccc-domain = { workspace = true }
+ccc-storage = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

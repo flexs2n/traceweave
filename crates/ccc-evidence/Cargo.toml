@@ -1,0 +1,16 @@
+[package]
+name = "ccc-evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ccc-domain = { workspace = true }
+ccc-storage = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+ccc-storage = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

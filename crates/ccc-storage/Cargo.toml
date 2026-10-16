@@ -1,0 +1,24 @@
+[package]
+name = "ccc-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ccc-domain = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+test-support = []
+
+[lints]
+workspace = true

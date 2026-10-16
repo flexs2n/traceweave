@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ccc-domain",
+    "crates/ccc-config",
+    "crates/ccc-repository",
+    "crates/ccc-snapshot",
+    "crates/ccc-storage",
+    "crates/ccc-schema",
+    "crates/ccc-tree-sitter",
+    "crates/ccc-indexer",
+    "crates/ccc-search",
+    "crates/ccc-evidence",
+    "crates/ccc-context-compiler",
+    "crates/ccc-impact",
+    "crates/ccc-jobs",
+    "crates/ccc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ccc-domain = { path = "crates/ccc-domain" }
+ccc-config = { path = "crates/ccc-config" }
+ccc-repository = { path = "crates/ccc-repository" }
+ccc-snapshot = { path = "crates/ccc-snapshot" }
+ccc-storage = { path = "crates/ccc-storage" }
+ccc-schema = { path = "crates/ccc-schema" }
+ccc-tree-sitter = { path = "crates/ccc-tree-sitter" }
+ccc-indexer = { path = "crates/ccc-indexer" }
+ccc-search = { path = "crates/ccc-search" }
+ccc-evidence = { path = "crates/ccc-evidence" }
+ccc-context-compiler = { path = "crates/ccc-context-compiler" }
+ccc-impact = { path = "crates/ccc-impact" }
+ccc-jobs = { path = "crates/ccc-jobs" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+blake3 = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
+async-trait = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+globset = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

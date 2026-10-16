@@ -1,0 +1,24 @@
+[package]
+name = "ccc-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ccc-domain = { workspace = true }
+ccc-config = { workspace = true }
+ccc-storage = { workspace = true }
+ccc-tree-sitter = { workspace = true }
+ccc-evidence = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+globset = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+ccc-repository = { workspace = true }
+ccc-snapshot = { workspace = true }
+
+[lints]
+workspace = true

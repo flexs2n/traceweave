@@ -4,6 +4,7 @@
 //! breaking change. Values are serialized as `snake_case` strings, with
 //! `tree_sitter` spelled exactly as the TIS specifies.
 
+use crate::error::CccError;
 use serde::{Deserialize, Serialize};
 
 /// Typed relationship between symbols or artifacts (TIS §6.2).
@@ -268,9 +269,57 @@ impl TestRelation {
     }
 }
 
+/// Product-facing classification of a memory record (SDD §5.11/§9.3, TIS
+/// §12). Serialized snake_case; the names are part of the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryType {
+    ArchitecturalDecision,
+    Invariant,
+    Convention,
+    DebuggingFinding,
+    FailedApproach,
+    BuildTestInstruction,
+    Incident,
+    KnownLimitation,
+    Handoff,
+    UnresolvedQuestion,
+}
+
+impl MemoryType {
+    /// The canonical serialized form used in records and CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryType::ArchitecturalDecision => "architectural_decision",
+            MemoryType::Invariant => "invariant",
+            MemoryType::Convention => "convention",
+            MemoryType::DebuggingFinding => "debugging_finding",
+            MemoryType::FailedApproach => "failed_approach",
+            MemoryType::BuildTestInstruction => "build_test_instruction",
+            MemoryType::Incident => "incident",
+            MemoryType::KnownLimitation => "known_limitation",
+            MemoryType::Handoff => "handoff",
+            MemoryType::UnresolvedQuestion => "unresolved_question",
+        }
+    }
+
+    /// Parses the canonical serialized form (`INVALID_REQUEST` on unknown
+    /// names — CLI input never falls back silently).
+    pub fn parse(s: &str) -> Result<Self, CccError> {
+        serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(|_| {
+            CccError::invalid_request(format!(
+                "unknown memory type {s:?}; known types: architectural_decision, invariant, \
+                 convention, debugging_finding, failed_approach, build_test_instruction, \
+                 incident, known_limitation, handoff, unresolved_question"
+            ))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorCode;
 
     #[test]
     fn relationship_types_serialize_per_tis() {
@@ -403,5 +452,33 @@ mod tests {
                 format!("\"{}\"", relation.as_str())
             );
         }
+    }
+
+    #[test]
+    fn memory_types_serialize_per_sdd_and_parse_strictly() {
+        for memory_type in [
+            MemoryType::ArchitecturalDecision,
+            MemoryType::Invariant,
+            MemoryType::Convention,
+            MemoryType::DebuggingFinding,
+            MemoryType::FailedApproach,
+            MemoryType::BuildTestInstruction,
+            MemoryType::Incident,
+            MemoryType::KnownLimitation,
+            MemoryType::Handoff,
+            MemoryType::UnresolvedQuestion,
+        ] {
+            let json = serde_json::to_string(&memory_type).unwrap();
+            assert_eq!(json, format!("\"{}\"", memory_type.as_str()));
+            let back: MemoryType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, memory_type);
+            assert_eq!(
+                MemoryType::parse(memory_type.as_str()).unwrap(),
+                memory_type
+            );
+        }
+        // Unknown names are rejected (no silent fallback, TIS §13.2).
+        let err = MemoryType::parse("best_practice").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
     }
 }

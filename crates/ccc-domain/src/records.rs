@@ -136,6 +136,59 @@ pub struct ClaimRecord {
     pub created_at: String,
     pub validated_at: Option<String>,
     pub updated_at: String,
+    /// Supersession link (SDD §5.8): set on the *new* claim that replaces the
+    /// superseded one. Supersession is versioning, not mutation — history is
+    /// immutable. Absent in pre-Step-3 serialized records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_claim_id: Option<ClaimId>,
+}
+
+/// A persistent engineering memory (SDD §5.11, TIS §12): the product-facing
+/// classification of useful engineering knowledge. Memory is *not* a second
+/// source of truth — it stays subordinate to current source, configuration
+/// and test results, and its status reuses [`ClaimStatus`] so staleness and
+/// conflicts surface with the same vocabulary as claims.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRecord {
+    pub memory_id: MemoryId,
+    pub repository_id: RepositoryId,
+    /// Snapshot the memory was authored against (revision scope, TIS §12).
+    pub snapshot_id: SnapshotId,
+    pub memory_type: MemoryType,
+    pub title: String,
+    pub summary: String,
+    /// Repository-relative scope: a directory prefix, or the empty string for
+    /// repository-wide. Different scopes are never auto-conflicted (SDD
+    /// §9.4 step 3 — scope differences are labeled, not resolved).
+    pub scope: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub last_accessed_at: String,
+    pub status: ClaimStatus,
+    pub sharing_policy: String,
+    pub sensitivity: String,
+    /// Supersession link: set on the new version that replaces the
+    /// superseded one (SDD §5.8 — edits create records, never mutations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_memory_id: Option<MemoryId>,
+    /// Recorded cause when the memory flipped `stale`/`conflicted` (FR-043:
+    /// freshness reporting carries the cause of invalidation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_cause: Option<String>,
+    pub updated_at: String,
+}
+
+/// One status transition of a memory record (FR-032: edits preserve history
+/// and provenance). Appended, never rewritten.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryStatusEvent {
+    pub event_id: MemoryEventId,
+    pub memory_id: MemoryId,
+    pub status: ClaimStatus,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub created_at: String,
 }
 
 /// An evidence record (TIS §6.3).

@@ -103,6 +103,14 @@ define_id!(
     /// Identifier of an immutable evaluation run record.
     EvaluationRunId
 );
+define_id!(
+    /// Identifier of a persistent engineering memory record (SDD §5.11).
+    MemoryId
+);
+define_id!(
+    /// Identifier of a memory status-transition event (history trail).
+    MemoryEventId
+);
 
 #[cfg(test)]
 mod tests {

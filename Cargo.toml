@@ -17,6 +17,7 @@ members = [
     "crates/ccc-verification",
     "crates/ccc-evaluation",
     "crates/ccc-jobs",
+    "crates/ccc-service",
     "crates/ccc-cli",
 ]
 
@@ -42,9 +43,10 @@ ccc-impact = { path = "crates/ccc-impact" }
 ccc-verification = { path = "crates/ccc-verification" }
 ccc-evaluation = { path = "crates/ccc-evaluation" }
 ccc-jobs = { path = "crates/ccc-jobs" }
+ccc-service = { path = "crates/ccc-service" }
 
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 blake3 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }

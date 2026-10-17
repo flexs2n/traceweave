@@ -194,27 +194,16 @@ name = "ccc-cli"
 version = "0.1.0"
 dependencies = [
  "ccc-config",
- "ccc-context-compiler",
  "ccc-domain",
- "ccc-evaluation",
- "ccc-evidence",
- "ccc-impact",
- "ccc-indexer",
- "ccc-jobs",
- "ccc-memory",
- "ccc-repository",
  "ccc-schema",
- "ccc-search",
- "ccc-snapshot",
+ "ccc-service",
  "ccc-storage",
  "ccc-tree-sitter",
- "ccc-verification",
  "clap",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "toml",
 ]
 
 [[package]]
@@ -372,6 +361,31 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "ccc-service"
+version = "0.1.0"
+dependencies = [
+ "ccc-config",
+ "ccc-context-compiler",
+ "ccc-domain",
+ "ccc-evaluation",
+ "ccc-impact",
+ "ccc-indexer",
+ "ccc-jobs",
+ "ccc-memory",
+ "ccc-repository",
+ "ccc-schema",
+ "ccc-search",
+ "ccc-snapshot",
+ "ccc-storage",
+ "ccc-verification",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

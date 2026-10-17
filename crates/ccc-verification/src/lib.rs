@@ -22,7 +22,8 @@ use ccc_impact::{AffectedArtifact, ChangeSet, ImpactAnalyzer};
 use ccc_repository::GitProvider;
 use ccc_schema::{hash_canonical, SCHEMA_VERSION};
 use ccc_storage::{
-    ArtifactStore, EvidenceStore, ImpactStore, IndexStore, StoreResult, VerificationStore,
+    ArtifactStore, EvidenceStore, ImpactStore, IndexStore, MemoryStore, StoreResult,
+    VerificationStore,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -97,6 +98,18 @@ pub struct VerificationReportDto {
     /// Evidence revalidation outcome (TIS §11.1 step 10, SDD §15.6): scoped
     /// claim flips with their provenance links.
     pub revalidation: revalidate::RevalidationSummary,
+    /// Memory ids captured from this failed authorized run (FR-033: agent
+    /// findings stay `candidate`; absent when nothing was captured).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured_findings: Vec<String>,
+    /// Conflict pairs the captured finding triggered (FR-034) — both sides
+    /// stay inspectable via `ccc conflicts`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_conflicts: Vec<String>,
+    /// Freshness projection over memories linked to the revalidated claims
+    /// (FR-043): staleness/conflicts flow into the linked memory records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_freshness: Option<ccc_memory::FreshnessSummary>,
     pub limitations: Vec<String>,
     pub created_at: String,
 }
@@ -105,6 +118,7 @@ pub struct VerificationReportDto {
 pub struct VerificationEngine<'a> {
     index: &'a dyn IndexStore,
     evidence: &'a dyn EvidenceStore,
+    memories: &'a dyn MemoryStore,
     verifications: &'a dyn VerificationStore,
     impacts: &'a dyn ImpactStore,
     artifacts: &'a dyn ArtifactStore,
@@ -118,6 +132,7 @@ impl<'a> VerificationEngine<'a> {
     pub fn new(
         index: &'a dyn IndexStore,
         evidence: &'a dyn EvidenceStore,
+        memories: &'a dyn MemoryStore,
         verifications: &'a dyn VerificationStore,
         impacts: &'a dyn ImpactStore,
         artifacts: &'a dyn ArtifactStore,
@@ -127,6 +142,7 @@ impl<'a> VerificationEngine<'a> {
         Self {
             index,
             evidence,
+            memories,
             verifications,
             impacts,
             artifacts,
@@ -257,6 +273,70 @@ impl<'a> VerificationEngine<'a> {
         })
         .await?;
 
+        // FR-043 freshness projection: memories linked to the revalidated
+        // claims follow their statuses (stale/conflicted with a cause).
+        let memory_freshness =
+            ccc_memory::project_claim_freshness(self.evidence, self.memories, repo.repository_id)
+                .await
+                .ok()
+                .filter(|s| {
+                    !s.stale_memories.is_empty()
+                        || !s.conflicted_memories.is_empty()
+                        || !s.recovered_memories.is_empty()
+                });
+
+        // FR-033 capture: a *failed authorized* run records the negative
+        // result as an agent finding — one candidate claim + one candidate
+        // memory linked to this verification (FR-080: never auto-promoted).
+        // Analysis/suggested runs execute nothing and capture nothing.
+        let mut captured_findings: Vec<String> = Vec::new();
+        let mut detected_conflicts: Vec<String> = Vec::new();
+        let failed_checks: Vec<&VerificationCheckDto> = checks
+            .iter()
+            .filter(|c| c.status == VerificationStatus::Failed.as_str())
+            .collect();
+        if policy.allow_execution && !failed_checks.is_empty() {
+            let commands: Vec<String> = failed_checks
+                .iter()
+                .map(|c| c.command.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let capture = ccc_memory::capture_agent_finding(
+                self.evidence,
+                self.memories,
+                repo.repository_id,
+                snapshot_id,
+                ccc_memory::AgentFinding {
+                    title: "Failed verification of the current patch".into(),
+                    summary: format!(
+                        "{} check(s) failed under policy {}: {}. Covered claims are marked \
+                         conflicted; this finding stays candidate until a later authorized \
+                         run passes.",
+                        failed_checks.len(),
+                        policy.name,
+                        commands.join(", ")
+                    ),
+                    memory_type: ccc_domain::MemoryType::DebuggingFinding,
+                    created_by: "agent:ccc-verification".into(),
+                    verification_id,
+                    covered_file_ids: &changed.file_ids,
+                    covered_symbol_ids: &changed.symbol_ids,
+                },
+            )
+            .await
+            .map_err(|e| CccError::internal_error(format!("agent finding capture: {e}")))?;
+            captured_findings.push(capture.memory.memory_id.to_string());
+            for pair in capture
+                .conflicts
+                .conflicted
+                .iter()
+                .chain(capture.conflicts.scope_differences.iter())
+            {
+                detected_conflicts.push(format!("{}|{}", pair.left_id, pair.right_id));
+            }
+        }
+
         // Claims tied to the changed set that are or will become stale
         // (TIS §11.1 step 4). After a reindex the dependent claims are
         // already stale (the indexer marks changed-file claims stale); they
@@ -309,6 +389,9 @@ impl<'a> VerificationEngine<'a> {
             statuses,
             observed_vs_predicted,
             revalidation,
+            captured_findings,
+            detected_conflicts,
+            memory_freshness,
             limitations,
             created_at: now_rfc3339(),
         };
@@ -577,6 +660,21 @@ pub fn render_verification_markdown(report: &VerificationReportDto) -> String {
             report.revalidation.conflicted_claims.len()
         ));
     }
+    if !report.captured_findings.is_empty() {
+        out.push_str(&format!(
+            "- captured: {} agent finding(s) recorded as candidate memories (FR-033, never \
+             auto-promoted)\n",
+            report.captured_findings.len()
+        ));
+    }
+    if let Some(freshness) = &report.memory_freshness {
+        out.push_str(&format!(
+            "- memory freshness: {} stale, {} conflicted, {} recovered (FR-043)\n",
+            freshness.stale_memories.len(),
+            freshness.conflicted_memories.len(),
+            freshness.recovered_memories.len()
+        ));
+    }
     if report.revalidation.ambiguous {
         out.push_str(&format!(
             "- no claim was touched: {} (ambiguous outcomes establish nothing)\n",
@@ -781,6 +879,7 @@ mod tests {
         verifications: &'a dyn VerificationStore,
     ) -> VerificationEngine<'a> {
         VerificationEngine::new(
+            &*fx.store,
             &*fx.store,
             &*fx.store,
             verifications,
@@ -1241,6 +1340,80 @@ mod tests {
         assert_eq!(
             negatives, evidence_count_failed,
             "negative evidence rows are preserved after a later pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_authorized_run_captures_an_agent_finding_memory() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let fx = setup_cargo().await;
+        std::fs::write(
+            fx.root.join("src/util.rs"),
+            "pub fn read_config() -> u8 { absolutely_not_defined(); }\n",
+        )
+        .unwrap();
+        run(&fx.root, &["add", "-A"]);
+        run(&fx.root, &["commit", "-m", "broken change"]);
+        index_current(&fx.store, &fx.artifacts, &fx.repo, &fx.cfg, &fx.root).await;
+
+        let verifications = ccc_storage::test_support::InMemoryVerificationStore::new();
+        let git = StubGit {
+            entries: util_modified(),
+        };
+        let report = engine(&fx, &git, &verifications)
+            .verify(&fx.repo, &fx.root, "HEAD~1", Some("HEAD"), &cargo_policy())
+            .await
+            .unwrap();
+
+        // FR-033: exactly one candidate memory was captured from the failed
+        // run; FR-080: it is never auto-promoted.
+        assert_eq!(report.captured_findings.len(), 1);
+        let memory_id = ccc_domain::MemoryId::from_str(&report.captured_findings[0]).unwrap();
+        let memory = fx.store.get_memory(memory_id).await.unwrap().unwrap();
+        assert_eq!(memory.status, ClaimStatus::Candidate);
+        assert_eq!(memory.created_by, "agent:ccc-verification");
+        let claim_ids = fx.store.claim_ids_for_memory(memory_id).await.unwrap();
+        assert_eq!(claim_ids.len(), 1);
+        let finding_claim = fx.store.get_claim(claim_ids[0]).await.unwrap().unwrap();
+        assert_eq!(finding_claim.status, ClaimStatus::Candidate);
+        assert_eq!(finding_claim.source_kind, "agent");
+        // The failure is linked to this verification record.
+        let deps = fx
+            .store
+            .list_claim_dependencies(&[finding_claim.claim_id])
+            .await
+            .unwrap();
+        assert!(deps.iter().any(|d| d.depends_on == report.verification_id));
+
+        // Analysis runs execute nothing and capture nothing.
+        let before = fx
+            .store
+            .list_memories(fx.repo.repository_id)
+            .await
+            .unwrap()
+            .len();
+        let git = StubGit {
+            entries: util_modified(),
+        };
+        let analysis = engine(&fx, &git, &verifications)
+            .verify(
+                &fx.repo,
+                &fx.root,
+                "HEAD",
+                Some("HEAD"),
+                &VerificationPolicy::analysis(),
+            )
+            .await
+            .unwrap();
+        assert!(analysis.captured_findings.is_empty());
+        assert_eq!(
+            fx.store
+                .list_memories(fx.repo.repository_id)
+                .await
+                .unwrap()
+                .len(),
+            before,
+            "analysis mode captures nothing"
         );
     }
 }

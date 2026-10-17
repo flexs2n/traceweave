@@ -162,7 +162,7 @@ cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
 
-105 tests cover the Step 2 surface — verification policies/executor per
+118 tests cover the Step 2 surface — verification policies/executor per
 status, scoped revalidation, evaluation determinism and integrity gates,
 tier-ordered selection, plus the golden CLI integration test
 (`crates/ccc-cli/tests/golden.rs`) and the dogfood fixture

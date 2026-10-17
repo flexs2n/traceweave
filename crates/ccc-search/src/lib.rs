@@ -31,6 +31,9 @@ pub struct SearchResponse {
     pub generation_id: GenerationId,
     /// Exact name matches first, then lexical matches.
     pub hits: Vec<SearchHit>,
+    /// Server-side latency of this search (TIS §18 observability).
+    #[serde(default)]
+    pub latency_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +85,7 @@ impl<'a> FtsSearchBackend<'a> {
 #[async_trait::async_trait]
 impl SearchBackend for FtsSearchBackend<'_> {
     async fn search(&self, request: SearchRequest) -> Result<SearchResponse, CccError> {
+        let started = std::time::Instant::now();
         let active = self
             .index_store
             .get_active_generation(request.repository_id)
@@ -111,6 +115,7 @@ impl SearchBackend for FtsSearchBackend<'_> {
                 snapshot_id: active.snapshot_id,
                 generation_id: active.generation_id,
                 hits,
+                latency_ms: started.elapsed().as_millis() as u64,
             });
         }
 
@@ -157,6 +162,7 @@ impl SearchBackend for FtsSearchBackend<'_> {
             snapshot_id: active.snapshot_id,
             generation_id: active.generation_id,
             hits,
+            latency_ms: started.elapsed().as_millis() as u64,
         })
     }
 }

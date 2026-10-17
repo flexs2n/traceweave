@@ -745,6 +745,7 @@ async fn index_once(
     snapshot_id: Option<&str>,
 ) -> Result<ccc_indexer::IndexOutcome, CccError> {
     let root = PathBuf::from(&repo.root_path);
+    let discovery_started = std::time::Instant::now();
     let (snapshot, manifest) = match snapshot_id {
         Some(id) => {
             let sid = SnapshotId::from_str(id)
@@ -774,6 +775,7 @@ async fn index_once(
             (snapshot, manifest)
         }
     };
+    let discovery_ms = discovery_started.elapsed().as_millis() as u64;
     // Production evidence goes to the SQLite store.
     let outcome = ccc_indexer::run_index(
         &**store,
@@ -789,6 +791,10 @@ async fn index_once(
         full,
     )
     .await?;
+    // Discovery happens in the snapshot build above; record it alongside the
+    // in-pipeline stage timings (TIS §18).
+    let mut outcome = outcome;
+    outcome.counters.timings_ms.discovery_ms = discovery_ms;
     Ok(outcome)
 }
 
@@ -927,6 +933,7 @@ async fn cmd_context_compile(
         &search_backend,
         &HeuristicNormalizer,
     );
+    let compile_started = std::time::Instant::now();
     match compiler
         .compile(&CompileRequest {
             repository_id: repo.repository_id,
@@ -937,11 +944,16 @@ async fn cmd_context_compile(
         .await
     {
         Ok(bundle) => {
+            let compile_latency_ms = compile_started.elapsed().as_millis() as u64;
+            let payload = serde_json::json!({
+                "bundle_id": bundle.bundle_id,
+                "latency_ms": compile_latency_ms,
+            });
             let _job = if job.state.is_terminal() {
                 // Idempotent replay: the logical job already completed.
                 job
             } else {
-                jobs::finish_success(&**store, job, Some(&bundle.bundle_id.to_string())).await?
+                jobs::finish_success(&**store, job, Some(&payload.to_string())).await?
             };
             match (format, json) {
                 (_, true) => print_json(&envelope(&bundle, meta_for(&repo, None, None))?)?,

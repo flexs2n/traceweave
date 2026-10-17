@@ -23,6 +23,27 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Stage timings for one index run (TIS §18: index duration by pipeline
+/// stage). Integer milliseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndexTimings {
+    /// File discovery + manifest hashing (snapshot build).
+    #[serde(default)]
+    pub discovery_ms: u64,
+    /// Exclusion classification.
+    #[serde(default)]
+    pub classify_ms: u64,
+    /// Tree-sitter parse/extraction (cache-aware).
+    #[serde(default)]
+    pub parse_ms: u64,
+    /// Persistence of files/symbols/edges/search/claims.
+    #[serde(default)]
+    pub write_ms: u64,
+    /// Atomic generation publication.
+    #[serde(default)]
+    pub publish_ms: u64,
+}
+
 /// Counters surfaced to `ccc index` output and metrics (TIS §18).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IndexCounters {
@@ -36,6 +57,9 @@ pub struct IndexCounters {
     pub unsupported: u64,
     /// Files that could not be read.
     pub failed: u64,
+    /// Stage timings (TIS §18).
+    #[serde(default)]
+    pub timings_ms: IndexTimings,
 }
 
 impl IndexCounters {
@@ -115,6 +139,7 @@ pub async fn run_index(
 
     // 4. Classification — exclusions are recorded, never silent (TIS §7.1).
     let mut counters = IndexCounters::default();
+    let classify_started = std::time::Instant::now();
     let exclude_matcher = build_exclude_matcher(&cfg.exclude_globs)?;
     let mut classified: Vec<ClassifiedFile> = Vec::new();
     for (path, content_hash) in manifest {
@@ -131,8 +156,10 @@ pub async fn run_index(
         classified.push(cf);
     }
     classified.sort_by(|a, b| a.record.path.cmp(&b.record.path));
+    counters.timings_ms.classify_ms = classify_started.elapsed().as_millis() as u64;
 
     // Content-addressed blob per included file (used later for excerpts).
+    let write_started = std::time::Instant::now();
     for cf in &classified {
         if let Some(bytes) = &cf.source {
             artifacts
@@ -154,6 +181,7 @@ pub async fn run_index(
         .iter()
         .filter(|cf| cf.record.inclusion == FileInclusion::Included)
         .collect();
+    let parse_started = std::time::Instant::now();
     let extractions = extract_files(
         artifacts,
         index_store,
@@ -163,6 +191,7 @@ pub async fn run_index(
         &mut counters,
     )
     .await?;
+    counters.timings_ms.parse_ms = parse_started.elapsed().as_millis() as u64;
 
     // 6. Symbol/reference/edge records with conservative resolution.
     let (symbols, _symbol_ids) = build_symbols(repo, snapshot, &classified, &extractions);
@@ -190,6 +219,7 @@ pub async fn run_index(
     index_store.insert_symbols(&all_symbols).await?;
     index_store.insert_references(&references).await?;
     index_store.insert_edges(&edges).await?;
+    counters.timings_ms.write_ms = write_started.elapsed().as_millis() as u64;
 
     // 7. Derived search entries (rebuildable, never authoritative — TIS §5.2).
     let entries = build_search_entries(&classified, &all_symbols);
@@ -256,11 +286,18 @@ pub async fn run_index(
     }
 
     // 10. Atomic publication (TIS §4.4 steps 4–6, SDD §7.5).
+    let publish_started = std::time::Instant::now();
     index_store
         .set_generation_counters(generation.generation_id, &counters.to_json())
         .await?;
     index_store
         .publish_generation(generation.generation_id)
+        .await?;
+    counters.timings_ms.publish_ms = publish_started.elapsed().as_millis() as u64;
+    // Rewrite the counters so the published generation carries the publish
+    // timing too (counters are the only mutable field after publication).
+    index_store
+        .set_generation_counters(generation.generation_id, &counters.to_json())
         .await?;
 
     Ok(IndexOutcome {

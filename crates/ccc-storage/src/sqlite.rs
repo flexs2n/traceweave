@@ -2649,7 +2649,10 @@ mod tests {
             .search_memories(repo.repository_id, "manifest", None, None, 10)
             .await
             .unwrap();
-        assert!(after_retract.is_empty(), "retracted records are not retrieved");
+        assert!(
+            after_retract.is_empty(),
+            "retracted records are not retrieved"
+        );
         let explicit = store
             .search_memories(
                 repo.repository_id,

@@ -1,14 +1,20 @@
 # traceweave / ccc
 
-Change-aware context compiler — Step 2 (verification + evaluation).
+Change-aware context compiler — Step 3 (engineering memory + conflicts).
 
 `ccc` indexes a git repository into immutable, content-addressed snapshots,
 extracts Rust symbols and name-level relationships with Tree-sitter, and
 compiles token-budgeted, provenance-carrying context bundles for engineering
-tasks. Step 2 closes the loop: *change → predicted impact → verification
+tasks. Step 2 closed the loop: *change → predicted impact → verification
 under an explicit execution policy → scoped evidence revalidation*, plus an
-offline evaluation harness that scores the retrieval pipeline against hashed
-golden suites. Everything runs locally; no LLM calls are made in this build
+offline evaluation harness. Step 3 adds the persistent engineering memory:
+human-authored records with provenance and immutable history (FR-032),
+agent-finding capture from failed authorized runs — always `candidate`
+(FR-033, FR-080), conservative contradiction detection with both sides kept
+inspectable (FR-034), memory FTS search (FR-035), a memory retrieval channel
+in the compiler, conflict-aware bundles (FR-060), and a freshness projection
+where linked memories follow their claims' statuses with recorded causes
+(FR-043). Everything runs locally; no LLM calls are made in this build
 (NFR-012: provider boundary is an explicit opt-in extension point).
 
 ## Stack
@@ -36,6 +42,7 @@ golden suites. Everything runs locally; no LLM calls are made in this build
 | `ccc-indexer` | incremental indexing pipeline, atomic publication |
 | `ccc-search` | lexical + exact symbol lookup |
 | `ccc-evidence` | evidence ledger, claim staleness seam (FR-040) |
+| `ccc-memory` | engineering memory: capture, contradiction detection, freshness projection, conflict resolution |
 | `ccc-context-compiler` | task → ranked, budgeted bundle (policy-v1) |
 | `ccc-impact` | change → impact report with conservative classification |
 | `ccc-verification` | execution policies, test selection, authorized executor, evidence revalidation |
@@ -99,6 +106,40 @@ $ ccc snapshot diff <snap-a> <snap-b>  # added/removed/changed/renamed paths
 $ ccc context diff <bundle-a> <bundle-b>  # item-level + evidence-status flips
 ```
 
+### Step 3: engineering memory (dogfooded on this repository)
+
+```console
+$ ccc memory add --title "Conflict detection scope rule: shared symbol ids only" \
+    --summary "Detection groups claims by identical resolved symbol dependencies…" \
+    --memory-type convention --scope crates/ccc-memory --created-by human:me
+Memory 01a149e1-27b8-…
+  status: candidate
+Detected 1 conflict pair(s) — inspect with `ccc conflicts`; conflicts are
+never auto-resolved.
+
+$ ccc conflicts
+memory_pair conflicted — scope: memory_scope:crates/ccc-memory (snapshots match)
+  left  01a149e1-… [Conflict detection scope rule: …]: …
+  right 01a149e2-… [Conflict detection scope rule: …]: …
+
+$ ccc memory resolve --keep 01a149e1-… --drop 01a149e2-… \
+    --rationale "the symbol-scoped rule is the implemented behavior" --actor human:me
+Resolution recorded: 01a149e2-… retracted; 01a149e1-… kept (returns to candidate).
+
+$ ccc memory search "memory transitions"     # FTS over title+summary
+$ ccc memory show 01a149e1-…                 # claim links + immutable status trail
+$ ccc memory list --status stale             # freshness projection output (FR-043)
+$ ccc evidence list --status conflicted      # the claim side of conflicts
+```
+
+Memory rules (SDD §5.11/§9.4, TIS §12): memory is **not a second source of
+truth** — it is subordinate to current source, configuration and test
+results; every transition appends an actor+reason event; retraction removes
+a record from active retrieval but preserves history; agent findings from
+failed authorized verifications are captured as `candidate` memories and are
+never auto-promoted (FR-080); conflicts always show both sides with
+provenance, and only an explicit human `resolve` retires a side.
+
 Doctor output on the reference environment (Windows):
 
 ```console
@@ -153,6 +194,14 @@ tree_sitter_rust     OK   — grammar parses
   beneath them, so revalidation is owed even when the text re-describes the
   current source (TIS §6.3; SDD §20.5 integrity scenario, covered by the
   evaluation harness).
+- Memory freshness is a projection, never a judgment: a memory linked to a
+  claim follows that claim's status (`stale`/`conflicted` with a recorded
+  cause; recovery to `candidate` only for claim-derived staleness), while
+  memories without claim links are untouched by invalidation. Terminal
+  states (`superseded`, `retracted`) are never touched by any transition.
+- The memory channel is tier-4 (last) in bundle selection and reuses the
+  existing `w_f`/`w_r` features — measured in E-003/E-004 with no weight
+  change; bundles without memory data stay byte-identical.
 
 ## Development
 
@@ -162,8 +211,11 @@ cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
 
-118 tests cover the Step 2 surface — verification policies/executor per
-status, scoped revalidation, evaluation determinism and integrity gates,
-tier-ordered selection, plus the golden CLI integration test
-(`crates/ccc-cli/tests/golden.rs`) and the dogfood fixture
+132 tests cover the Step 3 surface — memory stores/transitions/detection,
+agent-finding capture (never auto-promoted), freshness projection and
+recovery, conflict resolution with recorded rationale, verification
+policies/executor per status, scoped revalidation, evaluation determinism
+and integrity gates, tier-ordered selection with the memory channel, plus
+the golden CLI integration tests (`crates/ccc-cli/tests/golden.rs`: the
+vertical path and the memory/conflict flow) and the dogfood fixture
 (`tests/fixtures/rust-sample/`).

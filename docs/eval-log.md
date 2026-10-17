@@ -112,3 +112,104 @@ itself; each was either fixed in-repo or documented:
   verification honestly reports `failed`; work around by running a binary
   outside the verified tree. Self-hosting limitation, not a code defect.
 - **D-4 (fixed + promoted):** see E-002.
+
+---
+
+## E-003 — memory channel A/B (fixture repo, no weight change)
+
+- **Date:** 2026-10-17
+- **Suite:** `memory` (`eval/suites/memory.toml`, new in Step 3), suite hash
+  `c93a9d3927440797fb3f2489446eaacddabe14324fa92fe06715649e23075472`, run
+  against a fresh `rust-sample` fixture repository. Same config hash both
+  sides (`fca50f39b4dd36da…`), **policy-v1 on both sides** (the channel
+  reuses the existing `w_f`/`w_r` features — no new weight, per ADR-008).
+- **Change under test:** the new `Memory` retrieval channel (TIS §9.2
+  candidate source 7). Side A: no memory records exist (empty channel).
+  Side B: three titled memory records seeded via `ccc memory add`.
+
+### Measured result
+
+| Metric (memory suite) | A: empty channel | B: channel active |
+| --- | --- | --- |
+| tuning recall | 0‰ | **1000‰** |
+| tuning MRR | 0‰ | **583‰** |
+| tuning precision@10 | 0‰ | **583‰** |
+| tuning token cost | 86 | 159 |
+| held-out recall | 0‰ | **1000‰** |
+| held-out token cost | 82 | 116 |
+
+Run A: `01a149e0-339b-73ea-815b-e54f6b4c9d27` · Run B:
+`01a149e0-7d20-73ab-9e64-f588eab80173` (both immutable, `ccc eval show`).
+
+### Decision: keep the channel active in policy-v1 (no weight change)
+
+The channel surfaces memory records exactly when they match the task
+(0 → 1000‰ recall) at a modest token cost (+73 tuning tokens on a 3-file
+repo), and produces zero candidates — byte-identical bundles — when no
+memory data exists (the `w_h = 0` precedent, pinned by
+`memory_channel_surfaces_labeled_memories_and_conflicts`). The code-expectation
+fixture suite is unaffected (its golden run is unchanged). No new weight is
+introduced, so nothing to promote: **policy-v1 remains the shipping policy**.
+
+---
+
+## E-004 — dogfood suite v2 (memory cases on traceweave itself)
+
+- **Date:** 2026-10-17
+- **Suite:** `dogfood` v2 — two memory-channel cases appended
+  (new suite hash `046fdb67cb827ce02ee46610fb4fa408436f775dc34919b80dae29f249dad220`;
+  the v1 suite `bf09cb4f…` stays recorded). Run on traceweave itself, same
+  config hash both sides, **policy-v1 on both sides**.
+- **Change under test:** same as E-003, measured on a real 36-file
+  repository with realistic budgets (2500–4000 tokens).
+
+### Measured result
+
+| Metric (dogfood suite) | A: no memories | B: 3 memories seeded |
+| --- | --- | --- |
+| tuning recall (5 code cases + 1 memory case) | 850‰ | 850‰ |
+| tuning MRR | 148‰ | 148‰ |
+| tuning token cost | 15429 | 15429 |
+| held-out recall (2 cases) | 500‰ | 500‰ |
+| memory-title expectations (cases 5–6) | 0/1, 0/1 | 0/1, 0/1 |
+
+Run A: `01a149e0-fca2-76a6-b6ff-e1130c4ca2b4` · Run B:
+`01a149e1-d1c6-73c3-aa4d-584ddde2c602`.
+
+**Key observation:** the memory candidates *are generated* (case 5's
+`Memory transitions keep history` appears in the run-B omissions with reason
+`lower_relevance`) but are **not selected**: tier-4 priority (TIS §9.4
+priority 5 — engineering decisions come after task-critical code, deps and
+tests) exhausts the 2500–4000-token budgets on a large repository before the
+memory tier is reached. Code recall is unchanged (A ≡ B on every code
+expectation) — the channel adds no regression risk, but tight budgets keep
+memory items out on large repos.
+
+### Decision: keep policy-v1; record the budget-priority limitation
+
+No promotion: there is no measured improvement to adopt and the tier
+pre-order is the promoted E-002 contract — weakening it to boost memory
+visibility would need its own measured experiment (e.g. a small reserved
+memory quota in a policy-v3 candidate). The omission is visible, not silent:
+omitted memories are listed with their reason in every bundle.
+
+## Dogfood findings (2026-10-17, traceweave @ step-3)
+
+- **D-5 (documented):** PowerShell drops empty-string CLI args, so
+  `--scope ""` fails clap parsing with "a value is required". Repository-wide
+  memories are created by *omitting* `--scope` (the flag's default is empty);
+  the human output renders that as `(repository-wide)`.
+- **D-6 (documented, follow-up):** on large repositories with realistic
+  budgets, tier-4 memory items are generated but omitted
+  (`lower_relevance`/`budget_exceeded`) — see E-004. Candidate future work: a
+  versioned memory-quota policy, only behind a measured A/B.
+- **D-7 (documented):** the manual down-migration harness splits files on
+  `;` and skips chunks that begin with a comment line — a `;` or a leading
+  comment inside a down file silently changes which statements run. The 0003
+  down file therefore lists statements first, comments last; up files are
+  unaffected (sqlx's migrator handles comments).
+- **Freshness projection verified end-to-end:** the golden flow links a
+  memory to a `read_config` symbol claim, edits `util.rs`, reindexes, and the
+  memory flips `stale` with the recorded cause while unrelated memories stay
+  untouched (`golden_memory_and_conflict_flow`).
+

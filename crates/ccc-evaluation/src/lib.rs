@@ -273,6 +273,7 @@ impl<'a> EvalRunner<'a> {
                     task_text: case.task.clone(),
                     budget_tokens: case.budget,
                     weights_override: weights_override.cloned(),
+                    history_scores: None,
                 })
                 .await?;
 

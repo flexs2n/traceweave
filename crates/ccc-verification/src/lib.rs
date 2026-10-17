@@ -656,6 +656,13 @@ mod tests {
         fn rev_exists(&self, _root: &Path, _rev: &str) -> Result<bool, CccError> {
             Ok(true)
         }
+        fn log_name_status(
+            &self,
+            _root: &Path,
+            _limit: u32,
+        ) -> Result<Vec<ccc_repository::CommitLogEntry>, CccError> {
+            Ok(Vec::new())
+        }
     }
 
     struct Fixture {

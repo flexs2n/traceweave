@@ -176,6 +176,8 @@ struct Candidate {
     score: f64,
     token_cost: u64,
     evidence_status: String,
+    /// H feature: path recency in per-milli [0,1000] (0 = no history data).
+    recency_millis: u64,
 }
 
 /// Compile request inputs (TIS §9.1 subset used in step 1).
@@ -188,6 +190,10 @@ pub struct CompileRequest {
     /// the current `policy_weights_millis()` apply; overrides are recorded in
     /// the bundle's `weights_millis` so every bundle carries its policy.
     pub weights_override: Option<BTreeMap<String, i64>>,
+    /// Optional path → recency-millis map (H feature source, from
+    /// `history_recency_millis`). `None`/empty means no history data; with
+    /// the default `w_h = 0` bundles stay byte-identical either way.
+    pub history_scores: Option<BTreeMap<String, u64>>,
 }
 
 pub struct ContextCompiler<'a> {
@@ -302,6 +308,13 @@ impl<'a> ContextCompiler<'a> {
             candidate.evidence_status = self
                 .evidence_status_for(request.repository_id, &candidate.entity_id)
                 .await;
+        }
+
+        // H feature: path recency from the optional history map (TIS §9.3).
+        let empty_history = BTreeMap::new();
+        let history = request.history_scores.as_ref().unwrap_or(&empty_history);
+        for candidate in &mut candidates {
+            candidate.recency_millis = history.get(&candidate.path).copied().unwrap_or(0);
         }
 
         // Ranking (TIS §9.3): S(c) = w_l·L + w_d·D + w_t·T + w_h·H + w_f·F + w_r·R − w_x·X.
@@ -542,6 +555,7 @@ impl<'a> ContextCompiler<'a> {
             score: 0.0,
             token_cost: 0, // set after excerpt known
             evidence_status: "candidate".into(),
+            recency_millis: 0, // set after candidate generation (H feature)
         })
         .map(|mut c| {
             c.token_cost = estimate_tokens(&format!("{} {}", c.title, c.excerpt));
@@ -694,6 +708,7 @@ impl<'a> ContextCompiler<'a> {
             score: 0.0,
             token_cost,
             evidence_status: "candidate".into(),
+            recency_millis: 0, // set after candidate generation (H feature)
         }))
     }
 
@@ -749,7 +764,7 @@ fn features_for(c: &Candidate) -> Features {
         Channel::Test => 1.0,
         _ => 0.0,
     };
-    let h = 0.0; // history channel: not implemented in step 1
+    let h = c.recency_millis as f64 / 1000.0; // reciprocal-rank recency (H)
     let f = if c.evidence_status == "stale" {
         0.0
     } else {
@@ -1047,6 +1062,7 @@ fn smoke_run_app() { run_app(); }
             task_text: "how does read_config get called".into(),
             budget_tokens: 2000,
             weights_override: None,
+            history_scores: None,
         };
         let first = compiler.compile(&request).await.unwrap();
         let second = compiler.compile(&request).await.unwrap();
@@ -1107,6 +1123,7 @@ fn smoke_run_app() { run_app(); }
             task_text: "read_config run_app smoke".into(),
             budget_tokens: 40,
             weights_override: None,
+            history_scores: None,
         };
         let bundle = compiler.compile(&request).await.unwrap();
         assert!(
@@ -1164,6 +1181,7 @@ fn smoke_run_app() { run_app(); }
                 task_text: "read_config".into(),
                 budget_tokens: 4000,
                 weights_override: None,
+                history_scores: None,
             })
             .await
             .unwrap();
@@ -1176,5 +1194,84 @@ fn smoke_run_app() { run_app(); }
             "stale item carried, not dropped (FR-060)"
         );
         assert_eq!(stale_item.unwrap().evidence_status, "stale");
+    }
+
+    // -- T9: history channel (H feature) ------------------------------------
+
+    #[tokio::test]
+    async fn history_channel_keeps_bundles_byte_identical_while_w_h_is_zero() {
+        let fx = fixture_with_files(&[("src/lib.rs", LIB), ("src/util.rs", UTIL)]).await;
+        index_fixture(&fx).await;
+        let search_backend = ccc_search::FtsSearchBackend::new(&*fx.store, &*fx.store, &*fx.store);
+        let compiler = ContextCompiler::new(
+            &*fx.store,
+            &fx.evidence,
+            &*fx.store,
+            &fx.artifacts,
+            &search_backend,
+            &HeuristicNormalizer,
+        );
+        // Non-trivial history: util.rs touched most recently.
+        let mut history = std::collections::BTreeMap::new();
+        history.insert("src/util.rs".to_string(), 1000u64);
+        history.insert("src/lib.rs".to_string(), 500u64);
+
+        let without = compiler
+            .compile(&CompileRequest {
+                repository_id: fx.repo.repository_id,
+                task_text: "read_config run_app smoke".into(),
+                budget_tokens: 4000,
+                weights_override: None,
+                history_scores: None,
+            })
+            .await
+            .unwrap();
+        let with = compiler
+            .compile(&CompileRequest {
+                repository_id: fx.repo.repository_id,
+                task_text: "read_config run_app smoke".into(),
+                budget_tokens: 4000,
+                weights_override: None,
+                history_scores: Some(history.clone()),
+            })
+            .await
+            .unwrap();
+
+        // The invariant: while w_h = 0, history data cannot change a bundle
+        // (T9: default bundles byte-identical with the channel present).
+        assert_eq!(bundle_content_hash(&without), bundle_content_hash(&with));
+        assert_eq!(without.items, with.items);
+
+        // Weighted (w_h = 5000 via override), history genuinely influences
+        // selection: the channel flows when a policy promotes it.
+        let weighted: std::collections::BTreeMap<String, i64> = policy_weights_millis()
+            .into_iter()
+            .map(|(k, v)| if k == "w_h" { (k, 5000) } else { (k, v) })
+            .collect();
+        let weighted_history = compiler
+            .compile(&CompileRequest {
+                repository_id: fx.repo.repository_id,
+                task_text: "read_config run_app smoke".into(),
+                budget_tokens: 4000,
+                weights_override: Some(weighted.clone()),
+                history_scores: Some(history),
+            })
+            .await
+            .unwrap();
+        let weighted_plain = compiler
+            .compile(&CompileRequest {
+                repository_id: fx.repo.repository_id,
+                task_text: "read_config run_app smoke".into(),
+                budget_tokens: 4000,
+                weights_override: Some(weighted),
+                history_scores: None,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            bundle_content_hash(&weighted_history),
+            bundle_content_hash(&weighted_plain),
+            "with a non-zero w_h the history data must influence selection"
+        );
     }
 }

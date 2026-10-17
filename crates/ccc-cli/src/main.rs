@@ -934,12 +934,20 @@ async fn cmd_context_compile(
         &HeuristicNormalizer,
     );
     let compile_started = std::time::Instant::now();
+    // History recency (H feature): optional data; with w_h = 0 bundles are
+    // byte-identical with or without it (T9 constraint).
+    let root = PathBuf::from(&repo.root_path);
+    let history_scores = GitCli
+        .log_name_status(&root, 200)
+        .map(|log| ccc_repository::history_recency_millis(&log))
+        .unwrap_or_default();
     match compiler
         .compile(&CompileRequest {
             repository_id: repo.repository_id,
             task_text: task.to_string(),
             budget_tokens: budget,
             weights_override: None,
+            history_scores: Some(history_scores),
         })
         .await
     {

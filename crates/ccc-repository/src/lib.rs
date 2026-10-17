@@ -29,11 +29,25 @@ pub struct ChangeEntry {
     pub old_path: Option<String>,
 }
 
+/// One commit from the history log (H feature source, TIS §9.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitLogEntry {
+    /// Abbreviated commit hash.
+    pub commit: String,
+    /// Committer timestamp, RFC 3339.
+    pub timestamp: String,
+    /// Paths touched by the commit (repository-relative, forward slashes).
+    pub paths: Vec<String>,
+}
+
 /// Git access boundary (TIS §14).
 pub trait GitProvider: Send + Sync {
     fn is_git_repository(&self, root: &Path) -> bool;
     /// HEAD commit hash; `None` when the repository has no commits yet.
     fn rev_parse_head(&self, root: &Path) -> Result<Option<String>, CccError>;
+    /// Recent commit history with touched paths, most recent first
+    /// (H feature source). `limit` bounds the number of commits.
+    fn log_name_status(&self, root: &Path, limit: u32) -> Result<Vec<CommitLogEntry>, CccError>;
     /// Current branch name; `None` in detached-HEAD state.
     fn current_branch(&self, root: &Path) -> Result<Option<String>, CccError>;
     fn status_porcelain(&self, root: &Path) -> Result<Vec<StatusEntry>, CccError>;
@@ -182,6 +196,86 @@ impl GitProvider for GitCli {
             .map_err(|e| CccError::dependency_unavailable(format!("cannot execute git: {e}")))?;
         Ok(output.status.success())
     }
+
+    /// Recent commit history with touched paths, most recent first
+    /// (H feature source). `limit` bounds the number of commits.
+    fn log_name_status(&self, root: &Path, limit: u32) -> Result<Vec<CommitLogEntry>, CccError> {
+        let out = self.run(
+            root,
+            &[
+                "log",
+                "--name-only",
+                "--format=%h;%cI",
+                "--no-color",
+                &format!("-{limit}"),
+            ],
+        )?;
+        parse_log_name_only(&out)
+    }
+}
+
+/// Parses `git log --name-only --format=%h;%cI` output: header lines
+/// `hash;timestamp`, then one path per line. A header is recognized by a
+/// short hex hash before the `;` so file paths containing `;` stay paths.
+fn parse_log_name_only(out: &str) -> Result<Vec<CommitLogEntry>, CccError> {
+    let mut entries = Vec::new();
+    let mut current: Option<CommitLogEntry> = None;
+    for line in out.lines() {
+        if is_log_header(line) {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            let mut parts = line.splitn(2, ';');
+            let commit = parts.next().unwrap_or("").trim().to_string();
+            let timestamp = parts.next().unwrap_or("").trim().to_string();
+            current = Some(CommitLogEntry {
+                commit,
+                timestamp,
+                paths: Vec::new(),
+            });
+        } else if !line.trim().is_empty() {
+            match &mut current {
+                Some(entry) => entry.paths.push(normalize(line.trim())),
+                None => {
+                    return Err(CccError::internal_error(format!(
+                        "git log path before header: {line:?}"
+                    )))
+                }
+            }
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn is_log_header(line: &str) -> bool {
+    match line.split_once(';') {
+        Some((hash, stamp)) => {
+            (7..=40).contains(&hash.len())
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && stamp.len() >= 10
+        }
+        None => false,
+    }
+}
+
+/// Recency score per path (H feature, TIS §9.3): reciprocal-rank by commit
+/// position — the most recent commit scores 1000, the next 500, then 333…;
+/// a path takes its best score. Deterministic; documented fixed choice.
+pub fn history_recency_millis(log: &[CommitLogEntry]) -> std::collections::BTreeMap<String, u64> {
+    let mut scores = std::collections::BTreeMap::new();
+    for (position, entry) in log.iter().enumerate() {
+        let score = 1000u64 / (position as u64 + 1);
+        for path in &entry.paths {
+            let best = scores.get(path).copied().unwrap_or(0);
+            if score > best {
+                scores.insert(path.clone(), score);
+            }
+        }
+    }
+    scores
 }
 
 /// Normalizes a git-reported path to repo-relative forward-slash form.
@@ -461,6 +555,60 @@ mod tests {
         let status = git.status_porcelain(dir.path()).unwrap();
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].path, "file.rs");
+    }
+
+    #[test]
+    fn log_name_status_lists_recent_commits_most_recent_first() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init_repo(dir.path());
+        std::fs::write(dir.path().join("older.rs"), "pub fn a() {}\n").unwrap();
+        commit_all(dir.path(), "older");
+        std::fs::write(dir.path().join("newer.rs"), "pub fn b() {}\n").unwrap();
+        commit_all(dir.path(), "newer");
+        let git = GitCli;
+        let log = git.log_name_status(dir.path(), 10).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].paths, vec!["newer.rs".to_string()]);
+        assert_eq!(log[1].paths, vec!["older.rs".to_string()]);
+        assert!(
+            log[0].timestamp.contains('T') || log[0].timestamp.contains('+'),
+            "timestamp is RFC 3339-ish: {:?}",
+            log[0].timestamp
+        );
+        // Limit truncates to the most recent N commits.
+        let log = git.log_name_status(dir.path(), 1).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].paths, vec!["newer.rs".to_string()]);
+    }
+
+    #[test]
+    fn recency_scores_follow_reciprocal_rank_per_path() {
+        let log = vec![
+            CommitLogEntry {
+                commit: "a".into(),
+                timestamp: "2026-10-17T00:00:00Z".into(),
+                paths: vec!["src/recent.rs".into()],
+            },
+            CommitLogEntry {
+                commit: "b".into(),
+                timestamp: "2026-10-16T00:00:00Z".into(),
+                paths: vec!["src/older.rs".into(), "src/recent.rs".into()],
+            },
+            CommitLogEntry {
+                commit: "c".into(),
+                timestamp: "2026-10-15T00:00:00Z".into(),
+                paths: vec!["src/oldest.rs".into()],
+            },
+        ];
+        let scores = history_recency_millis(&log);
+        // Best rank wins per path: rank 0 → 1000, rank 1 → 500, rank 2 → 333.
+        assert_eq!(scores.get("src/recent.rs"), Some(&1000));
+        assert_eq!(scores.get("src/older.rs"), Some(&500));
+        assert_eq!(scores.get("src/oldest.rs"), Some(&333));
+        // Paths absent from history have no entry (H = 0 there).
+        assert!(!scores.contains_key("src/unknown.rs"));
+        // Empty log → empty map.
+        assert!(history_recency_millis(&[]).is_empty());
     }
 
     #[tokio::test]

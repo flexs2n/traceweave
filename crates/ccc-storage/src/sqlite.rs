@@ -1017,7 +1017,7 @@ impl EvidenceStore for SqliteStore {
         for c in records {
             sqlx::query(
                 "INSERT INTO claims (claim_id, repository_id, snapshot_id, claim_type, text, status, source_kind, \
-                 confidence_category, created_at, validated_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 confidence_category, created_at, validated_at, updated_at, supersedes_claim_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(c.claim_id.to_string())
             .bind(c.repository_id.to_string())
@@ -1030,6 +1030,7 @@ impl EvidenceStore for SqliteStore {
             .bind(&c.created_at)
             .bind(c.validated_at.clone())
             .bind(&c.updated_at)
+            .bind(c.supersedes_claim_id.map(|id| id.to_string()))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -1049,6 +1050,35 @@ impl EvidenceStore for SqliteStore {
                 .map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)
+    }
+
+    async fn list_claim_dependencies(
+        &self,
+        claim_ids: &[ClaimId],
+    ) -> StoreResult<Vec<ClaimDependencyRecord>> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; claim_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT claim_id, depends_on, depends_on_kind FROM claim_dependencies \
+             WHERE claim_id IN ({placeholders}) ORDER BY claim_id, depends_on"
+        );
+        let mut query = sqlx::query(&sql);
+        for claim_id in claim_ids {
+            query = query.bind(claim_id.to_string());
+        }
+        let rows = query.fetch_all(&self.reader).await.map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(ClaimDependencyRecord {
+                    claim_id: ClaimId::from_str(&string(r, "claim_id")).ok()?,
+                    depends_on: string(r, "depends_on"),
+                    depends_on_kind: string(r, "depends_on_kind"),
+                })
+            })
+            .collect())
     }
 
     async fn get_claim(&self, id: ClaimId) -> StoreResult<Option<ClaimRecord>> {
@@ -1167,6 +1197,36 @@ impl EvidenceStore for SqliteStore {
         .map_err(db_err)?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn mark_claims_superseded(
+        &self,
+        claim_ids: &[ClaimId],
+        superseded_by: ClaimId,
+        updated_at: &str,
+    ) -> StoreResult<Vec<ClaimId>> {
+        let mut tx = self.writer.begin().await.map_err(db_err)?;
+        let mut updated = Vec::new();
+        for claim_id in claim_ids {
+            // A claim can never supersede itself (SDD §5.8 versioning).
+            if *claim_id == superseded_by {
+                continue;
+            }
+            let result = sqlx::query(
+                "UPDATE claims SET status = 'superseded', updated_at = ? \
+                 WHERE claim_id = ? AND status NOT IN ('superseded', 'retracted')",
+            )
+            .bind(updated_at)
+            .bind(claim_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if result.rows_affected() > 0 {
+                updated.push(*claim_id);
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(updated)
+    }
 }
 
 fn row_to_claim(row: &SqliteRow) -> StoreResult<ClaimRecord> {
@@ -1187,6 +1247,8 @@ fn row_to_claim(row: &SqliteRow) -> StoreResult<ClaimRecord> {
         created_at: string(row, "created_at"),
         validated_at: opt_string(row, "validated_at"),
         updated_at: string(row, "updated_at"),
+        supersedes_claim_id: opt_string(row, "supersedes_claim_id")
+            .and_then(|s| ClaimId::from_str(&s).ok()),
     })
 }
 
@@ -1213,6 +1275,336 @@ fn row_to_evidence(row: &SqliteRow) -> StoreResult<EvidenceRecord> {
         validation_outcome: opt_string(row, "validation_outcome"),
         created_at: string(row, "created_at"),
     })
+}
+
+fn memory_type_from(s: &str) -> MemoryType {
+    MemoryType::parse(s).unwrap_or(MemoryType::UnresolvedQuestion)
+}
+
+fn memory_claim_status_from(s: &str) -> ClaimStatus {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .unwrap_or(ClaimStatus::Candidate)
+}
+
+const MEMORY_COLS: &str = "memory_id, repository_id, snapshot_id, memory_type, title, summary, \
+     scope, created_by, created_at, last_accessed_at, status, sharing_policy, sensitivity, \
+     supersedes_memory_id, stale_cause, updated_at";
+
+fn row_to_memory(row: &SqliteRow) -> StoreResult<MemoryRecord> {
+    Ok(MemoryRecord {
+        memory_id: MemoryId::from_str(&string(row, "memory_id"))?,
+        repository_id: RepositoryId::from_str(&string(row, "repository_id"))?,
+        snapshot_id: SnapshotId::from_str(&string(row, "snapshot_id"))?,
+        memory_type: memory_type_from(&string(row, "memory_type")),
+        title: string(row, "title"),
+        summary: string(row, "summary"),
+        scope: string(row, "scope"),
+        created_by: string(row, "created_by"),
+        created_at: string(row, "created_at"),
+        last_accessed_at: string(row, "last_accessed_at"),
+        status: memory_claim_status_from(&string(row, "status")),
+        sharing_policy: string(row, "sharing_policy"),
+        sensitivity: string(row, "sensitivity"),
+        supersedes_memory_id: opt_string(row, "supersedes_memory_id")
+            .and_then(|s| MemoryId::from_str(&s).ok()),
+        stale_cause: opt_string(row, "stale_cause"),
+        updated_at: string(row, "updated_at"),
+    })
+}
+
+/// Tokens for the derived memory FTS index: lowercase alphanumeric runs of at
+/// least two characters. The index is rebuildable and never the sole source
+/// of provenance (TIS §5.2).
+fn memory_terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// Replaces the FTS rows of one memory inside the caller's transaction.
+async fn replace_memory_fts(tx: &mut Tx<'_>, record: &MemoryRecord) -> StoreResult<()> {
+    sqlx::query("DELETE FROM memory_fts WHERE memory_id = ?")
+        .bind(record.memory_id.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    let mut terms: Vec<String> = Vec::new();
+    for text in [&record.title, &record.summary] {
+        for token in memory_terms(text) {
+            if !terms.contains(&token) {
+                terms.push(token);
+            }
+        }
+    }
+    for term in terms {
+        sqlx::query("INSERT INTO memory_fts (term, memory_id, repository_id) VALUES (?, ?, ?)")
+            .bind(term)
+            .bind(record.memory_id.to_string())
+            .bind(record.repository_id.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl MemoryStore for SqliteStore {
+    async fn insert_memory(&self, record: &MemoryRecord, claim_ids: &[ClaimId]) -> StoreResult<()> {
+        let mut tx = self.writer.begin().await.map_err(db_err)?;
+        sqlx::query(&format!(
+            "INSERT INTO memory_records ({MEMORY_COLS}) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
+        .bind(record.memory_id.to_string())
+        .bind(record.repository_id.to_string())
+        .bind(record.snapshot_id.to_string())
+        .bind(record.memory_type.as_str())
+        .bind(&record.title)
+        .bind(&record.summary)
+        .bind(&record.scope)
+        .bind(&record.created_by)
+        .bind(&record.created_at)
+        .bind(&record.last_accessed_at)
+        .bind(
+            serde_json::to_string(&record.status)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+        )
+        .bind(&record.sharing_policy)
+        .bind(&record.sensitivity)
+        .bind(record.supersedes_memory_id.map(|id| id.to_string()))
+        .bind(record.stale_cause.clone())
+        .bind(&record.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        for claim_id in claim_ids {
+            sqlx::query("INSERT OR IGNORE INTO memory_claims (memory_id, claim_id) VALUES (?, ?)")
+                .bind(record.memory_id.to_string())
+                .bind(claim_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
+        replace_memory_fts(&mut tx, record).await?;
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn get_memory(&self, id: MemoryId) -> StoreResult<Option<MemoryRecord>> {
+        let row = sqlx::query("SELECT * FROM memory_records WHERE memory_id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.reader)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row_to_memory(&r)).transpose()
+    }
+
+    async fn list_memories(&self, repository_id: RepositoryId) -> StoreResult<Vec<MemoryRecord>> {
+        let rows =
+            sqlx::query("SELECT * FROM memory_records WHERE repository_id = ? ORDER BY created_at")
+                .bind(repository_id.to_string())
+                .fetch_all(&self.reader)
+                .await
+                .map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
+    }
+
+    async fn list_memories_by_status(
+        &self,
+        repository_id: RepositoryId,
+        statuses: &[ClaimStatus],
+    ) -> StoreResult<Vec<MemoryRecord>> {
+        if statuses.is_empty() {
+            return self.list_memories(repository_id).await;
+        }
+        let rendered: Vec<String> = statuses
+            .iter()
+            .map(|s| {
+                serde_json::to_string(s)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .collect();
+        let placeholders = vec!["?"; rendered.len()].join(", ");
+        let sql = format!(
+            "SELECT * FROM memory_records WHERE repository_id = ? AND status IN ({placeholders}) \
+             ORDER BY created_at"
+        );
+        let mut query = sqlx::query(&sql).bind(repository_id.to_string());
+        for status in &rendered {
+            query = query.bind(status);
+        }
+        let rows = query.fetch_all(&self.reader).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
+    }
+
+    async fn search_memories(
+        &self,
+        repository_id: RepositoryId,
+        query: &str,
+        status: Option<ClaimStatus>,
+        memory_type: Option<MemoryType>,
+        limit: u32,
+    ) -> StoreResult<Vec<MemoryRecord>> {
+        // Sanitize: each whitespace-separated term becomes a quoted FTS5
+        // token, OR-combined (same discipline as the lexical channel).
+        let match_query = quote_fts(query);
+        if match_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut clauses: Vec<String> = vec!["m.repository_id = ?".into()];
+        if status.is_some() {
+            clauses.push("m.status = ?".into());
+        }
+        if memory_type.is_some() {
+            clauses.push("m.memory_type = ?".into());
+        }
+        let sql = format!(
+            "SELECT m.* FROM memory_records m \
+             JOIN (SELECT DISTINCT memory_id FROM memory_fts WHERE memory_fts MATCH ?) f \
+             ON f.memory_id = m.memory_id \
+             WHERE {} ORDER BY m.created_at DESC LIMIT ?",
+            clauses.join(" AND ")
+        );
+        let mut q = sqlx::query(&sql).bind(&match_query);
+        q = q.bind(repository_id.to_string());
+        if let Some(status) = status {
+            q = q.bind(
+                serde_json::to_string(&status)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
+            );
+        }
+        if let Some(memory_type) = memory_type {
+            q = q.bind(memory_type.as_str());
+        }
+        q = q.bind(limit as i64);
+        let rows = q.fetch_all(&self.reader).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
+    }
+
+    async fn claim_ids_for_memory(&self, memory_id: MemoryId) -> StoreResult<Vec<ClaimId>> {
+        let rows =
+            sqlx::query("SELECT claim_id FROM memory_claims WHERE memory_id = ? ORDER BY claim_id")
+                .bind(memory_id.to_string())
+                .fetch_all(&self.reader)
+                .await
+                .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| ClaimId::from_str(&string(r, "claim_id")).ok())
+            .collect())
+    }
+
+    async fn memories_for_claims(&self, claim_ids: &[ClaimId]) -> StoreResult<Vec<MemoryRecord>> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; claim_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT DISTINCT m.* FROM memory_records m \
+             JOIN memory_claims mc ON mc.memory_id = m.memory_id \
+             WHERE mc.claim_id IN ({placeholders}) ORDER BY m.created_at"
+        );
+        let mut query = sqlx::query(&sql);
+        for claim_id in claim_ids {
+            query = query.bind(claim_id.to_string());
+        }
+        let rows = query.fetch_all(&self.reader).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
+    }
+
+    async fn update_memory_status(
+        &self,
+        memory_id: MemoryId,
+        status: ClaimStatus,
+        actor: &str,
+        reason: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<bool> {
+        let mut tx = self.writer.begin().await.map_err(db_err)?;
+        let status_str = serde_json::to_string(&status)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+        // The invalidation cause is recorded on the record only for
+        // freshness-bearing statuses (FR-043); leaving them clears it.
+        let stale_cause = match status {
+            ClaimStatus::Stale | ClaimStatus::Conflicted => reason.map(str::to_string),
+            _ => None,
+        };
+        let result = sqlx::query(
+            "UPDATE memory_records SET status = ?, stale_cause = ?, updated_at = ? \
+             WHERE memory_id = ? AND status NOT IN ('superseded', 'retracted')",
+        )
+        .bind(&status_str)
+        .bind(stale_cause)
+        .bind(updated_at)
+        .bind(memory_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO memory_status_events (event_id, memory_id, status, actor, reason, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(MemoryEventId::generate().to_string())
+        .bind(memory_id.to_string())
+        .bind(&status_str)
+        .bind(actor)
+        .bind(reason)
+        .bind(updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(true)
+    }
+
+    async fn list_memory_status_events(
+        &self,
+        memory_id: MemoryId,
+    ) -> StoreResult<Vec<MemoryStatusEvent>> {
+        let rows = sqlx::query(
+            "SELECT * FROM memory_status_events WHERE memory_id = ? ORDER BY created_at",
+        )
+        .bind(memory_id.to_string())
+        .fetch_all(&self.reader)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.iter().map(row_to_memory_event).collect())
+    }
+
+    async fn touch_memory(&self, memory_id: MemoryId, accessed_at: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE memory_records SET last_accessed_at = ? WHERE memory_id = ?")
+            .bind(accessed_at)
+            .bind(memory_id.to_string())
+            .execute(&self.writer)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+fn row_to_memory_event(row: &SqliteRow) -> MemoryStatusEvent {
+    MemoryStatusEvent {
+        event_id: MemoryEventId::from_str(&string(row, "event_id"))
+            .unwrap_or_else(|_| MemoryEventId::generate()),
+        memory_id: MemoryId::from_str(&string(row, "memory_id"))
+            .unwrap_or_else(|_| MemoryId::generate()),
+        status: memory_claim_status_from(&string(row, "status")),
+        actor: string(row, "actor"),
+        reason: opt_string(row, "reason"),
+        created_at: string(row, "created_at"),
+    }
 }
 
 #[async_trait::async_trait]
@@ -1892,6 +2284,7 @@ mod tests {
         let migrator = sqlx::migrate!("../../migrations/sqlite");
         let pool = store2.writer_pool().clone();
         for down_file in [
+            include_str!("../../../migrations/sqlite/manual-down/0003_memory_down.sql"),
             include_str!("../../../migrations/sqlite/manual-down/0002_verification_eval_down.sql"),
             include_str!("../../../migrations/sqlite/manual-down/0001_init_down.sql"),
         ] {
@@ -2051,6 +2444,7 @@ mod tests {
             created_at: now_rfc3339(),
             validated_at: None,
             updated_at: now_rfc3339(),
+            supersedes_claim_id: None,
         };
         store
             .insert_claims(std::slice::from_ref(&claim))
@@ -2089,6 +2483,215 @@ mod tests {
         assert!(!untouched);
         let final_claim = store.get_claim(claim.claim_id).await.unwrap().unwrap();
         assert_eq!(final_claim.status, ClaimStatus::Retracted);
+    }
+
+    #[tokio::test]
+    async fn memory_records_round_trip_search_and_transitions() {
+        let (_dir, store) = temp_store().await;
+        let repo = repo_record();
+        store.insert_repository(&repo).await.unwrap();
+        let snapshot = snapshot_record(&repo);
+        store.insert_snapshot(&snapshot).await.unwrap();
+        let claim = ClaimRecord {
+            claim_id: ClaimId::generate(),
+            repository_id: repo.repository_id,
+            snapshot_id: snapshot.snapshot_id,
+            claim_type: "symbol_existence".into(),
+            text: "claim".into(),
+            status: ClaimStatus::Candidate,
+            source_kind: "extracted".into(),
+            confidence_category: ConfidenceCategory::Unverified,
+            created_at: now_rfc3339(),
+            validated_at: None,
+            updated_at: now_rfc3339(),
+            supersedes_claim_id: None,
+        };
+        store
+            .insert_claims(std::slice::from_ref(&claim))
+            .await
+            .unwrap();
+
+        let memory = MemoryRecord {
+            memory_id: MemoryId::generate(),
+            repository_id: repo.repository_id,
+            snapshot_id: snapshot.snapshot_id,
+            memory_type: MemoryType::FailedApproach,
+            title: "Do not cache manifest hashes".into(),
+            summary: "Caching manifest hashes caused stale bundles in snapshot identity.".into(),
+            scope: "crates/ccc-snapshot".into(),
+            created_by: "human:test".into(),
+            created_at: now_rfc3339(),
+            last_accessed_at: now_rfc3339(),
+            status: ClaimStatus::Candidate,
+            sharing_policy: "private".into(),
+            sensitivity: "none".into(),
+            supersedes_memory_id: None,
+            stale_cause: None,
+            updated_at: now_rfc3339(),
+        };
+        store
+            .insert_memory(&memory, &[claim.claim_id])
+            .await
+            .unwrap();
+
+        let fetched = store.get_memory(memory.memory_id).await.unwrap().unwrap();
+        assert_eq!(fetched, memory);
+        assert_eq!(
+            store.claim_ids_for_memory(memory.memory_id).await.unwrap(),
+            vec![claim.claim_id]
+        );
+        let linked = store.memories_for_claims(&[claim.claim_id]).await.unwrap();
+        assert_eq!(linked.len(), 1);
+
+        // FTS search hits on title tokens; filters narrow it.
+        let hits = store
+            .search_memories(repo.repository_id, "manifest caching", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "title+summary terms match: {hits:?}");
+        let wrong_type = store
+            .search_memories(
+                repo.repository_id,
+                "manifest",
+                None,
+                Some(MemoryType::Incident),
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(wrong_type.is_empty());
+        let wrong_status = store
+            .search_memories(
+                repo.repository_id,
+                "manifest",
+                Some(ClaimStatus::Verified),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(wrong_status.is_empty());
+
+        // Transition appends an event and records the cause; terminal states
+        // are never touched.
+        let now = now_rfc3339();
+        let flipped = store
+            .update_memory_status(
+                memory.memory_id,
+                ClaimStatus::Stale,
+                "ccc-freshness",
+                Some("claim went stale after file change"),
+                &now,
+            )
+            .await
+            .unwrap();
+        assert!(flipped);
+        let stale = store.get_memory(memory.memory_id).await.unwrap().unwrap();
+        assert_eq!(stale.status, ClaimStatus::Stale);
+        assert_eq!(
+            stale.stale_cause.as_deref(),
+            Some("claim went stale after file change")
+        );
+        let by_status = store
+            .list_memories_by_status(repo.repository_id, &[ClaimStatus::Stale])
+            .await
+            .unwrap();
+        assert_eq!(by_status.len(), 1);
+        let events = store
+            .list_memory_status_events(memory.memory_id)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "ccc-freshness");
+
+        store
+            .update_memory_status(
+                memory.memory_id,
+                ClaimStatus::Retracted,
+                "human:test",
+                None,
+                &now,
+            )
+            .await
+            .unwrap();
+        let untouched = store
+            .update_memory_status(
+                memory.memory_id,
+                ClaimStatus::Candidate,
+                "ccc-test",
+                None,
+                &now,
+            )
+            .await
+            .unwrap();
+        assert!(!untouched, "retracted memories are terminal");
+        assert_eq!(
+            store
+                .list_memory_status_events(memory.memory_id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        store
+            .touch_memory(memory.memory_id, "2026-10-17T00:00:00Z")
+            .await
+            .unwrap();
+        let touched = store.get_memory(memory.memory_id).await.unwrap().unwrap();
+        assert_eq!(touched.last_accessed_at, "2026-10-17T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn mark_claims_superseded_respects_terminal_states_and_self() {
+        let (_dir, store) = temp_store().await;
+        let repo = repo_record();
+        store.insert_repository(&repo).await.unwrap();
+        let snapshot = snapshot_record(&repo);
+        store.insert_snapshot(&snapshot).await.unwrap();
+        let mk = |text: &str| ClaimRecord {
+            claim_id: ClaimId::generate(),
+            repository_id: repo.repository_id,
+            snapshot_id: snapshot.snapshot_id,
+            claim_type: "finding".into(),
+            text: text.into(),
+            status: ClaimStatus::Candidate,
+            source_kind: "human".into(),
+            confidence_category: ConfidenceCategory::Unverified,
+            created_at: now_rfc3339(),
+            validated_at: None,
+            updated_at: now_rfc3339(),
+            supersedes_claim_id: None,
+        };
+        let active = mk("active");
+        let terminal = ClaimRecord {
+            status: ClaimStatus::Retracted,
+            ..mk("terminal")
+        };
+        let flippable = ClaimRecord {
+            status: ClaimStatus::Supported,
+            ..mk("flippable")
+        };
+        store
+            .insert_claims(&[active.clone(), terminal.clone(), flippable.clone()])
+            .await
+            .unwrap();
+
+        // Self-supersession is filtered out; retracted claims stay terminal;
+        // the non-terminal claim flips.
+        let flipped = store
+            .mark_claims_superseded(
+                &[active.claim_id, terminal.claim_id, flippable.claim_id],
+                active.claim_id,
+                &now_rfc3339(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flipped, vec![flippable.claim_id]);
+        let old = store.get_claim(terminal.claim_id).await.unwrap().unwrap();
+        assert_eq!(old.status, ClaimStatus::Retracted);
+        let superseded = store.get_claim(flippable.claim_id).await.unwrap().unwrap();
+        assert_eq!(superseded.status, ClaimStatus::Superseded);
     }
 
     #[tokio::test]
@@ -2292,6 +2895,7 @@ mod tests {
             created_at: now.clone(),
             validated_at: None,
             updated_at: now.clone(),
+            supersedes_claim_id: None,
         };
         store
             .insert_claims(std::slice::from_ref(&claim))

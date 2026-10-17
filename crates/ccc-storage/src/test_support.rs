@@ -540,6 +540,18 @@ impl EvidenceStore for InMemoryEvidenceStore {
             .extend(links.iter().cloned());
         Ok(())
     }
+    async fn list_claim_dependencies(
+        &self,
+        claim_ids: &[ClaimId],
+    ) -> StoreResult<Vec<ClaimDependencyRecord>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .dependencies
+            .iter()
+            .filter(|d| claim_ids.contains(&d.claim_id))
+            .cloned()
+            .collect())
+    }
     async fn get_claim(&self, id: ClaimId) -> StoreResult<Option<ClaimRecord>> {
         Ok(self
             .inner
@@ -629,6 +641,30 @@ impl EvidenceStore for InMemoryEvidenceStore {
         Ok(updated)
     }
 
+    async fn mark_claims_superseded(
+        &self,
+        claim_ids: &[ClaimId],
+        superseded_by: ClaimId,
+        updated_at: &str,
+    ) -> StoreResult<Vec<ClaimId>> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut updated = Vec::new();
+        for claim in &mut inner.claims {
+            if claim_ids.contains(&claim.claim_id)
+                && claim.claim_id != superseded_by
+                && !matches!(
+                    claim.status,
+                    ClaimStatus::Superseded | ClaimStatus::Retracted
+                )
+            {
+                claim.status = ClaimStatus::Superseded;
+                claim.updated_at = updated_at.to_string();
+                updated.push(claim.claim_id);
+            }
+        }
+        Ok(updated)
+    }
+
     async fn update_claim_validation(
         &self,
         claim_id: ClaimId,
@@ -653,6 +689,200 @@ impl EvidenceStore for InMemoryEvidenceStore {
             }
             _ => Ok(false),
         }
+    }
+}
+
+/// In-memory [`MemoryStore`] (same transition semantics as the SQLite
+/// adapter: terminal states are never touched, events append immutably).
+#[derive(Default)]
+pub struct InMemoryMemoryStore {
+    inner: Mutex<MemoryInner>,
+}
+
+#[derive(Default)]
+struct MemoryInner {
+    memories: Vec<MemoryRecord>,
+    claim_links: Vec<(MemoryId, ClaimId)>,
+    events: Vec<MemoryStatusEvent>,
+}
+
+impl InMemoryMemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryStore for InMemoryMemoryStore {
+    async fn insert_memory(&self, record: &MemoryRecord, claim_ids: &[ClaimId]) -> StoreResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.memories.push(record.clone());
+        for claim_id in claim_ids {
+            inner.claim_links.push((record.memory_id, *claim_id));
+        }
+        Ok(())
+    }
+
+    async fn get_memory(&self, id: MemoryId) -> StoreResult<Option<MemoryRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .memories
+            .iter()
+            .find(|m| m.memory_id == id)
+            .cloned())
+    }
+
+    async fn list_memories(&self, repository_id: RepositoryId) -> StoreResult<Vec<MemoryRecord>> {
+        let inner = self.inner.lock().unwrap();
+        let mut memories: Vec<MemoryRecord> = inner
+            .memories
+            .iter()
+            .filter(|m| m.repository_id == repository_id)
+            .cloned()
+            .collect();
+        memories.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(memories)
+    }
+
+    async fn list_memories_by_status(
+        &self,
+        repository_id: RepositoryId,
+        statuses: &[ClaimStatus],
+    ) -> StoreResult<Vec<MemoryRecord>> {
+        let all = self.list_memories(repository_id).await?;
+        Ok(all
+            .into_iter()
+            .filter(|m| statuses.contains(&m.status))
+            .collect())
+    }
+
+    async fn search_memories(
+        &self,
+        repository_id: RepositoryId,
+        query: &str,
+        status: Option<ClaimStatus>,
+        memory_type: Option<MemoryType>,
+        limit: u32,
+    ) -> StoreResult<Vec<MemoryRecord>> {
+        let terms: Vec<String> = query
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| t.len() >= 2)
+            .map(str::to_string)
+            .collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.lock().unwrap();
+        let mut hits: Vec<MemoryRecord> = inner
+            .memories
+            .iter()
+            .filter(|m| m.repository_id == repository_id)
+            .filter(|m| {
+                let haystack = format!("{} {}", m.title, m.summary).to_ascii_lowercase();
+                terms.iter().any(|t| haystack.contains(t.as_str()))
+            })
+            .filter(|m| status.is_none_or(|s| m.status == s))
+            .filter(|m| memory_type.is_none_or(|t| m.memory_type == t))
+            .cloned()
+            .collect();
+        hits.reverse(); // newest first, mirroring the SQLite ORDER BY created_at DESC
+        hits.truncate(limit as usize);
+        Ok(hits)
+    }
+
+    async fn claim_ids_for_memory(&self, memory_id: MemoryId) -> StoreResult<Vec<ClaimId>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .claim_links
+            .iter()
+            .filter(|(m, _)| *m == memory_id)
+            .map(|(_, c)| *c)
+            .collect())
+    }
+
+    async fn memories_for_claims(&self, claim_ids: &[ClaimId]) -> StoreResult<Vec<MemoryRecord>> {
+        let inner = self.inner.lock().unwrap();
+        let linked: Vec<MemoryId> = inner
+            .claim_links
+            .iter()
+            .filter(|(_, c)| claim_ids.contains(c))
+            .map(|(m, _)| *m)
+            .collect();
+        let mut memories: Vec<MemoryRecord> = inner
+            .memories
+            .iter()
+            .filter(|m| linked.contains(&m.memory_id))
+            .cloned()
+            .collect();
+        memories.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(memories)
+    }
+
+    async fn update_memory_status(
+        &self,
+        memory_id: MemoryId,
+        status: ClaimStatus,
+        actor: &str,
+        reason: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(record) = inner.memories.iter_mut().find(|m| m.memory_id == memory_id) else {
+            return Ok(false);
+        };
+        if matches!(
+            record.status,
+            ClaimStatus::Superseded | ClaimStatus::Retracted
+        ) {
+            return Ok(false);
+        }
+        record.status = status;
+        record.stale_cause = match status {
+            ClaimStatus::Stale | ClaimStatus::Conflicted => reason.map(str::to_string),
+            _ => None,
+        };
+        record.updated_at = updated_at.to_string();
+        inner.events.push(MemoryStatusEvent {
+            event_id: MemoryEventId::generate(),
+            memory_id,
+            status,
+            actor: actor.to_string(),
+            reason: reason.map(str::to_string),
+            created_at: updated_at.to_string(),
+        });
+        Ok(true)
+    }
+
+    async fn list_memory_status_events(
+        &self,
+        memory_id: MemoryId,
+    ) -> StoreResult<Vec<MemoryStatusEvent>> {
+        let inner = self.inner.lock().unwrap();
+        let mut events: Vec<MemoryStatusEvent> = inner
+            .events
+            .iter()
+            .filter(|e| e.memory_id == memory_id)
+            .cloned()
+            .collect();
+        events.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(events)
+    }
+
+    async fn touch_memory(&self, memory_id: MemoryId, accessed_at: &str) -> StoreResult<()> {
+        if let Some(record) = self
+            .inner
+            .lock()
+            .unwrap()
+            .memories
+            .iter_mut()
+            .find(|m| m.memory_id == memory_id)
+        {
+            record.last_accessed_at = accessed_at.to_string();
+        }
+        Ok(())
     }
 }
 

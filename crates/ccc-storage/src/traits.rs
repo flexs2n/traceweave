@@ -164,6 +164,12 @@ pub trait EvidenceStore: Send + Sync {
     async fn insert_evidence(&self, records: &[EvidenceRecord]) -> StoreResult<()>;
     async fn insert_claims(&self, records: &[ClaimRecord]) -> StoreResult<()>;
     async fn insert_claim_dependencies(&self, links: &[ClaimDependencyRecord]) -> StoreResult<()>;
+    /// Dependency links of the given claims (TIS §6.3) — the scope map used
+    /// by selective invalidation and contradiction detection.
+    async fn list_claim_dependencies(
+        &self,
+        claim_ids: &[ClaimId],
+    ) -> StoreResult<Vec<ClaimDependencyRecord>>;
     async fn get_claim(&self, id: ClaimId) -> StoreResult<Option<ClaimRecord>>;
     async fn get_evidence(&self, id: EvidenceId) -> StoreResult<Option<EvidenceRecord>>;
     async fn list_claims(&self, repository_id: RepositoryId) -> StoreResult<Vec<ClaimRecord>>;
@@ -194,6 +200,65 @@ pub trait EvidenceStore: Send + Sync {
         validated_at: Option<&str>,
         updated_at: &str,
     ) -> StoreResult<bool>;
+    /// Flips claims to `superseded` (SDD §5.8 versioning). Terminal states
+    /// (`superseded`, `retracted`) are never touched; a claim can never
+    /// supersede itself. Returns the ids of claims that were updated.
+    async fn mark_claims_superseded(
+        &self,
+        claim_ids: &[ClaimId],
+        superseded_by: ClaimId,
+        updated_at: &str,
+    ) -> StoreResult<Vec<ClaimId>>;
+}
+
+/// Persistent engineering memory (SDD §5.11, TIS §12). Memory is a
+/// projection over claims: status reuses [`ClaimStatus`], terminal states
+/// (`superseded`, `retracted`) are never touched by transitions, and every
+/// transition appends an immutable status event (FR-032 history).
+#[async_trait::async_trait]
+pub trait MemoryStore: Send + Sync {
+    /// Inserts a memory with its claim links in one transaction.
+    async fn insert_memory(&self, record: &MemoryRecord, claim_ids: &[ClaimId]) -> StoreResult<()>;
+    async fn get_memory(&self, id: MemoryId) -> StoreResult<Option<MemoryRecord>>;
+    async fn list_memories(&self, repository_id: RepositoryId) -> StoreResult<Vec<MemoryRecord>>;
+    async fn list_memories_by_status(
+        &self,
+        repository_id: RepositoryId,
+        statuses: &[ClaimStatus],
+    ) -> StoreResult<Vec<MemoryRecord>>;
+    /// FTS5 search over title+summary with optional status/type filters
+    /// (FR-035). Unknown terms match nothing; user text never reaches FTS5
+    /// syntax unquoted.
+    async fn search_memories(
+        &self,
+        repository_id: RepositoryId,
+        query: &str,
+        status: Option<ClaimStatus>,
+        memory_type: Option<MemoryType>,
+        limit: u32,
+    ) -> StoreResult<Vec<MemoryRecord>>;
+    /// Claim links of one memory (the projection's supporting claims).
+    async fn claim_ids_for_memory(&self, memory_id: MemoryId) -> StoreResult<Vec<ClaimId>>;
+    /// Memories linked to any of the given claims (freshness projection).
+    async fn memories_for_claims(&self, claim_ids: &[ClaimId]) -> StoreResult<Vec<MemoryRecord>>;
+    /// Applies a status transition with actor+reason provenance (FR-032):
+    /// appends a status event and updates the row. Returns `false` when the
+    /// memory does not exist; terminal states are never touched.
+    async fn update_memory_status(
+        &self,
+        memory_id: MemoryId,
+        status: ClaimStatus,
+        actor: &str,
+        reason: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<bool>;
+    /// Appended transition history of one memory.
+    async fn list_memory_status_events(
+        &self,
+        memory_id: MemoryId,
+    ) -> StoreResult<Vec<MemoryStatusEvent>>;
+    /// Records access (`last_accessed_at`, SDD §5.11).
+    async fn touch_memory(&self, memory_id: MemoryId, accessed_at: &str) -> StoreResult<()>;
 }
 
 /// Job records (TIS §15.1).

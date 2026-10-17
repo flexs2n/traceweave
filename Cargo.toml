@@ -11,6 +11,7 @@ members = [
     "crates/ccc-indexer",
     "crates/ccc-search",
     "crates/ccc-evidence",
+    "crates/ccc-memory",
     "crates/ccc-context-compiler",
     "crates/ccc-impact",
     "crates/ccc-verification",
@@ -35,6 +36,7 @@ ccc-tree-sitter = { path = "crates/ccc-tree-sitter" }
 ccc-indexer = { path = "crates/ccc-indexer" }
 ccc-search = { path = "crates/ccc-search" }
 ccc-evidence = { path = "crates/ccc-evidence" }
+ccc-memory = { path = "crates/ccc-memory" }
 ccc-context-compiler = { path = "crates/ccc-context-compiler" }
 ccc-impact = { path = "crates/ccc-impact" }
 ccc-verification = { path = "crates/ccc-verification" }

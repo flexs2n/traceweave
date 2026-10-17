@@ -201,6 +201,7 @@ dependencies = [
  "ccc-impact",
  "ccc-indexer",
  "ccc-jobs",
+ "ccc-memory",
  "ccc-repository",
  "ccc-schema",
  "ccc-search",
@@ -234,6 +235,7 @@ dependencies = [
  "ccc-config",
  "ccc-domain",
  "ccc-indexer",
+ "ccc-memory",
  "ccc-repository",
  "ccc-schema",
  "ccc-search",
@@ -330,6 +332,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ccc-memory"
+version = "0.1.0"
+dependencies = [
+ "ccc-domain",
+ "ccc-storage",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ccc-repository"
 version = "0.1.0"
 dependencies = [
@@ -404,6 +417,7 @@ dependencies = [
  "ccc-domain",
  "ccc-impact",
  "ccc-indexer",
+ "ccc-memory",
  "ccc-repository",
  "ccc-schema",
  "ccc-snapshot",

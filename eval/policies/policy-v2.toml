@@ -1,0 +1,15 @@
+# Candidate retrieval-policy weights for the A/B experiment (ADR-008).
+# Baseline is policy-v1 (see ccc-context-compiler::policy_weights_millis):
+# w_l 1000, w_d 900, w_t 600, w_h 0, w_f 400, w_r 300, w_x 500.
+# Hypothesis: dependency proximity matters more than the redundancy penalty
+# for narrow tasks; raising w_d and lowering w_x should improve precision
+# without hurting recall. Promotion only on measured improvement (eval-log).
+
+[weights]
+w_l = 1000
+w_d = 1100
+w_t = 600
+w_h = 0
+w_f = 400
+w_r = 300
+w_x = 400

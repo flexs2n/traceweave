@@ -247,6 +247,15 @@ impl<'a> EvalRunner<'a> {
             .unwrap_or_else(policy_weights_millis);
         let policy_hash = hash_canonical(&effective_weights)
             .map_err(|e| CccError::internal_error(format!("policy hash: {e}")))?;
+        // Overridden runs carry an explicit version label — never silently
+        // mislabeled as the current policy (ADR-008 provenance).
+        let policy_version = match weights_override {
+            Some(_) => format!(
+                "policy-override-{}",
+                &policy_hash[..policy_hash.len().min(12)]
+            ),
+            None => RETRIEVAL_POLICY_VERSION.into(),
+        };
         let compiler = ContextCompiler::new(
             self.index,
             self.evidence,
@@ -291,7 +300,7 @@ impl<'a> EvalRunner<'a> {
             schema_version: SCHEMA_VERSION.into(),
             suite_name: suite.file.name.clone(),
             suite_hash: suite.suite_hash.clone(),
-            retrieval_policy_version: RETRIEVAL_POLICY_VERSION.into(),
+            retrieval_policy_version: policy_version,
             policy_hash,
             config_hash: config_hash.to_string(),
             cases,
@@ -764,5 +773,103 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched.config_hash, "cfg-hash");
+    }
+
+    // -- T8: controlled policy A/B (ADR-008) --------------------------------
+
+    /// A retrieval-policy override file ([weights] table) — mirrors the CLI
+    /// loader shape.
+    #[derive(Debug, serde::Deserialize)]
+    struct WeightsOverrideFile {
+        weights: std::collections::BTreeMap<String, i64>,
+    }
+
+    fn v2_weights() -> std::collections::BTreeMap<String, i64> {
+        std::collections::BTreeMap::from([
+            ("w_l".into(), 1000),
+            ("w_d".into(), 1100),
+            ("w_t".into(), 600),
+            ("w_h".into(), 0),
+            ("w_f".into(), 400),
+            ("w_r".into(), 300),
+            ("w_x".into(), 400),
+        ])
+    }
+
+    #[tokio::test]
+    async fn policy_ab_records_two_runs_with_distinct_policy_hashes() {
+        let fx = setup().await;
+        // The shipped candidate file must parse into the exact v2 weights.
+        let v2_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("eval")
+            .join("policies")
+            .join("policy-v2.toml");
+        let raw = std::fs::read_to_string(&v2_path).unwrap();
+        let file: WeightsOverrideFile = toml::from_str(&raw).unwrap();
+        let override_weights = file.weights;
+        assert_eq!(override_weights, v2_weights());
+
+        let suite_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("eval")
+            .join("suites")
+            .join("fixture.toml");
+        let suite = load_suite(&suite_path).unwrap();
+
+        // Run A: current policy-v1. Run B: the v2 candidate weights.
+        let v1 = eval_run!(fx, &fx.evaluation, &suite).unwrap();
+        let v2 = {
+            let search = FtsSearchBackend::new(&*fx.store, &*fx.store, &*fx.store);
+            EvalRunner::new(
+                &*fx.store,
+                &*fx.store,
+                &*fx.store,
+                &fx.artifacts,
+                &search,
+                &fx.evaluation,
+            )
+            .run_suite(&fx.repo, &suite, "cfg-hash", Some(&override_weights))
+            .await
+            .unwrap()
+        };
+
+        // Both runs recorded against the same immutable suite, with distinct
+        // policy hashes (no silent weight edits — ADR-008).
+        assert_ne!(v1.policy_hash, v2.policy_hash);
+        assert_eq!(v1.suite_hash, v2.suite_hash);
+        let runs = fx
+            .evaluation
+            .list_runs(fx.repo.repository_id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        let hashes: std::collections::HashSet<String> =
+            runs.iter().map(|r| r.policy_hash.clone()).collect();
+        assert_eq!(hashes.len(), 2);
+        assert!(runs.iter().all(|r| r.suite_hash == suite.suite_hash));
+        // Determinism holds per policy: rerunning v2 reproduces its metrics.
+        let v2_again = {
+            let search = FtsSearchBackend::new(&*fx.store, &*fx.store, &*fx.store);
+            EvalRunner::new(
+                &*fx.store,
+                &*fx.store,
+                &*fx.store,
+                &fx.artifacts,
+                &search,
+                &fx.evaluation,
+            )
+            .run_suite(&fx.repo, &suite, "cfg-hash", Some(&override_weights))
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            serde_json::to_string(&v2).unwrap(),
+            serde_json::to_string(&v2_again).unwrap()
+        );
+        // The comparison data the eval-log needs (both sides measured).
+        assert_eq!(v1.tuning.cases, v2.tuning.cases);
     }
 }

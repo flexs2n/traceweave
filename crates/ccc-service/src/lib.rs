@@ -28,7 +28,7 @@ pub use eval::{eval_run, eval_show};
 pub use evidence::{evidence_list, evidence_show};
 pub use export::export_data;
 pub use impact::impact_analyze;
-pub use index::{index_once, index_repo, status};
+pub use index::{index_current, index_once, index_repo, status};
 pub use memory::{
     conflicts, memory_add, memory_list, memory_resolve, memory_retract, memory_search, memory_show,
     memory_supersede,
@@ -143,6 +143,7 @@ pub fn meta_for(
         snapshot_id: snapshot.map(|s| s.to_string()),
         generation_id: generation.map(|g| g.to_string()),
         request_id: None,
+        index_current: None,
     }
 }
 
@@ -157,7 +158,13 @@ pub async fn resolve_repo(
     if let Some(path) = repo {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| CccError::invalid_request(format!("cannot resolve path: {e}")))?;
-        let normalized = canonical.to_string_lossy().replace('\\', "/");
+        // Strip the Windows extended-length prefix (matching how register
+        // stores root paths) and normalize separators.
+        let canonical_str = canonical.to_string_lossy().replace('\\', "/");
+        let normalized = canonical_str
+            .strip_prefix("//?/")
+            .unwrap_or(&canonical_str)
+            .to_string();
         if let Some(found) = store.find_repository_by_path(&normalized).await? {
             return Ok(found);
         }

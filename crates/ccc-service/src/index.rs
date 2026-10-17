@@ -164,6 +164,28 @@ pub async fn index_once(
     Ok(outcome)
 }
 
+/// FR-010 drift guard: cheap identity check of the active index generation
+/// against the repository's current state — the snapshot's HEAD commit and
+/// dirty flag must both match. A projection computed on demand; it is never
+/// persisted and never enters bundle bytes (bundle DTOs stay byte-identical).
+/// Returns `false` when no active generation exists.
+pub async fn index_current(store: &SqliteStore, repo: &RepositoryRecord) -> Result<bool, CccError> {
+    let active = match store.get_active_generation(repo.repository_id).await? {
+        Some(gen) => gen,
+        None => return Ok(false),
+    };
+    let snapshot = store
+        .get_snapshot(active.snapshot_id)
+        .await?
+        .ok_or_else(|| {
+            CccError::snapshot_not_found("active generation's snapshot record missing")
+        })?;
+    let root = PathBuf::from(&repo.root_path);
+    let head = GitCli.rev_parse_head(&root)?.unwrap_or_default();
+    let dirty = !GitCli.status_porcelain(&root)?.is_empty();
+    Ok(snapshot.commit_hash.unwrap_or_default() == head && snapshot.is_dirty == dirty)
+}
+
 pub async fn status(
     ctx: &AppContext,
     repo_path: Option<&std::path::Path>,
@@ -171,6 +193,7 @@ pub async fn status(
     let store: &SqliteStore = &ctx.store;
     let repo = resolve_repo(store, repo_path).await?;
     let active = store.get_active_generation(repo.repository_id).await?;
+    let current = index_current(store, &repo).await?;
     let mut status = serde_json::json!({
         "repository_id": repo.repository_id.to_string(),
         "root_path": repo.root_path,
@@ -215,11 +238,21 @@ pub async fn status(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        human.push_str(&format!(
+            "Index current: {}\n",
+            if current {
+                "yes"
+            } else {
+                "no (repository changed since indexing; run `ccc index`)"
+            }
+        ));
     } else {
         human.push_str(&format!(
             "Repository {} at {} — not indexed yet\n",
             repo.repository_id, repo.root_path
         ));
     }
-    output(&status, meta_for(&repo, None, None), human)
+    let mut meta = meta_for(&repo, None, None);
+    meta.index_current = Some(current);
+    output(&status, meta, human)
 }

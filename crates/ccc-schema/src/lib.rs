@@ -43,6 +43,11 @@ pub struct EnvelopeMeta {
     pub generation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// FR-010 drift projection: whether the active index generation matches
+    /// the repository's current state (HEAD + dirty flag). Response meta
+    /// only — never part of a bundle DTO, so bundle bytes stay identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_current: Option<bool>,
 }
 
 /// CLI/API error envelope (TIS §13.2).

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ccc-domain = { workspace = true }
+ccc-memory = { workspace = true }
 ccc-schema = { workspace = true }
 ccc-storage = { workspace = true }
 ccc-search = { workspace = true }

@@ -145,6 +145,24 @@ pub struct BundleOmission {
     pub reason: String,
 }
 
+/// A conflict carried in a bundle (FR-060, TIS §9.7): when selected
+/// evidence is `conflicted`, both sides and their shared scope ship with the
+/// bundle — never a silent preference for one side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BundleConflict {
+    /// Deterministic pair identity (sorted entity ids joined), so identical
+    /// conflict sets hash identically.
+    pub conflict_id: String,
+    /// Entity ids (claims or memories) of both sides.
+    pub entity_ids: Vec<String>,
+    pub titles: Vec<String>,
+    pub texts: Vec<String>,
+    /// Shared scope description (e.g. `symbol:<id>` / `memory_scope:<value>`).
+    pub shared_scope: String,
+    /// Always `conflicted` here; scope-differing pairs are never included.
+    pub status: String,
+}
+
 /// The full context bundle document (TIS §9.7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BundleDto {
@@ -166,6 +184,10 @@ pub struct BundleDto {
     pub dependency_paths: Vec<DependencyPathEdge>,
     pub omissions: Vec<BundleOmission>,
     pub limitations: Vec<String>,
+    /// Conflicted evidence touching the selected items (FR-060). Absent when
+    /// empty so pre-Step-3 bundles stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<BundleConflict>,
     pub created_at: String,
 }
 
@@ -205,6 +227,14 @@ pub struct BundleHashInput<'a> {
     pub dependency_paths: &'a [DependencyPathEdge],
     pub omissions: &'a [BundleOmission],
     pub limitations: &'a [String],
+    /// Excluded from the hash when empty: bundles without conflicts hash
+    /// identically to pre-Step-3 bundles (the w_h = 0 precedent).
+    #[serde(skip_serializing_if = "conflicts_are_empty")]
+    pub conflicts: &'a [BundleConflict],
+}
+
+fn conflicts_are_empty(conflicts: &&[BundleConflict]) -> bool {
+    conflicts.is_empty()
 }
 
 /// Renders a bundle as readable Markdown (FR-063).
@@ -256,6 +286,21 @@ pub fn render_bundle_markdown(bundle: &BundleDto) -> String {
             out.push_str(&format!(
                 "- `{}` ({}) — score {}e-3, reason: {}\n",
                 o.title, o.path, o.score_millis, o.reason
+            ));
+        }
+    }
+    if !bundle.conflicts.is_empty() {
+        out.push_str("\n## Conflicts (both sides shown, never auto-resolved)\n\n");
+        for c in &bundle.conflicts {
+            out.push_str(&format!(
+                "- {} — scope: {}, sides: {}\n",
+                c.conflict_id,
+                c.shared_scope,
+                c.titles
+                    .iter()
+                    .map(|t| format!("`{t}`"))
+                    .collect::<Vec<_>>()
+                    .join(" vs ")
             ));
         }
     }

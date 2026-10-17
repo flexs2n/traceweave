@@ -14,11 +14,13 @@
 
 use ccc_domain::*;
 use ccc_schema::{
-    render_bundle_markdown, BundleDto, BundleHashInput, BundleItem, BundleOmission,
+    render_bundle_markdown, BundleConflict, BundleDto, BundleHashInput, BundleItem, BundleOmission,
     DependencyPathEdge, ItemProvenance, SpanDto, TaskDto, SCHEMA_VERSION,
 };
 use ccc_search::{SearchBackend, SearchRequest};
-use ccc_storage::{ArtifactStore, BundleStore, EvidenceStore, IndexStore, StoreResult};
+use ccc_storage::{
+    ArtifactStore, BundleStore, EvidenceStore, IndexStore, MemoryStore, StoreResult,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Versioned retrieval policy (TIS §9.3). Weights are integer millis; they
@@ -139,6 +141,7 @@ enum Channel {
     Lexical,
     Dependency(u32),
     Test,
+    Memory,
 }
 
 impl Channel {
@@ -148,15 +151,19 @@ impl Channel {
             Channel::Lexical => "lexical".into(),
             Channel::Dependency(d) => format!("dependency_depth_{d}"),
             Channel::Test => "test".into(),
+            Channel::Memory => "memory".into(),
         }
     }
-    /// Priority tier (TIS §9.4): task-critical → deps → tests.
+    /// Priority tier (TIS §9.4): task-critical → deps → tests → memory
+    /// (memory is subordinate to source and test evidence; the placement is
+    /// measured by the ADR-008 memory-channel experiment, E-003).
     fn tier(&self) -> u32 {
         match self {
             Channel::Symbol | Channel::Lexical => 0,
             Channel::Dependency(1) => 1,
             Channel::Dependency(_) => 2,
             Channel::Test => 3,
+            Channel::Memory => 4,
         }
     }
 }
@@ -199,6 +206,7 @@ pub struct CompileRequest {
 pub struct ContextCompiler<'a> {
     index_store: &'a dyn IndexStore,
     evidence_store: &'a dyn EvidenceStore,
+    memory_store: &'a dyn MemoryStore,
     bundle_store: &'a dyn BundleStore,
     artifacts: &'a dyn ArtifactStore,
     search_backend: &'a dyn SearchBackend,
@@ -210,6 +218,7 @@ impl<'a> ContextCompiler<'a> {
     pub fn new(
         index_store: &'a dyn IndexStore,
         evidence_store: &'a dyn EvidenceStore,
+        memory_store: &'a dyn MemoryStore,
         bundle_store: &'a dyn BundleStore,
         artifacts: &'a dyn ArtifactStore,
         search_backend: &'a dyn SearchBackend,
@@ -218,6 +227,7 @@ impl<'a> ContextCompiler<'a> {
         Self {
             index_store,
             evidence_store,
+            memory_store,
             bundle_store,
             artifacts,
             search_backend,
@@ -310,6 +320,41 @@ impl<'a> ContextCompiler<'a> {
                 .await;
         }
 
+        // Channel 7: engineering memory (TIS §9.2, FR-035). Memory items
+        // carry their own status as the evidence label — stale/conflicted
+        // memory is included only with the explicit label, never as current
+        // guidance (SDD §9.5). With no memory records the channel produces
+        // no candidates and bundles stay byte-identical (w_h = 0 precedent).
+        for memory in self
+            .memory_store
+            .search_memories(request.repository_id, &request.task_text, None, None, 50)
+            .await?
+        {
+            if !seen_entities.insert(memory.memory_id.to_string()) {
+                continue;
+            }
+            let token_cost = estimate_tokens(&format!("{} {}", memory.title, memory.summary));
+            candidates.push(Candidate {
+                entity_id: memory.memory_id.to_string(),
+                item_kind: "memory",
+                title: memory.title.clone(),
+                path: memory.scope.clone(),
+                span: None,
+                excerpt: memory.summary.clone(),
+                content_hash: blake3_hex(memory.summary.as_bytes()),
+                resolution_status: None,
+                channel: Channel::Memory,
+                score_millis: 0,
+                score: 0.0,
+                token_cost,
+                evidence_status: serde_json::to_string(&memory.status)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
+                recency_millis: 0,
+            });
+        }
+
         // H feature: path recency from the optional history map (TIS §9.3).
         let empty_history = BTreeMap::new();
         let history = request.history_scores.as_ref().unwrap_or(&empty_history);
@@ -350,6 +395,14 @@ impl<'a> ContextCompiler<'a> {
         // penalization, explicit omissions (TIS §9.4, §13.7).
         let (selected, omissions, stopping_reason) =
             select_within_budget(&candidates, request.budget_tokens);
+
+        // FR-060: conflicted evidence touching the selected items ships in
+        // the bundle's conflicts section with both sides + scope; conflicted
+        // items omitted under budget pressure are recorded with the reason
+        // `conflicting_evidence` (never a silent preference).
+        let conflicts = self
+            .conflict_section(request.repository_id, &selected, &omissions)
+            .await?;
 
         // Assemble the bundle document.
         let bundle_id = BundleId::generate();
@@ -414,6 +467,7 @@ impl<'a> ContextCompiler<'a> {
             dependency_paths: &dependency_paths,
             omissions: &omissions,
             limitations: &limitations,
+            conflicts: &conflicts,
         };
         let bundle_hash = ccc_schema::hash_canonical(&hash_input)
             .map_err(|e| CccError::internal_error(format!("canonical hashing failed: {e}")))?;
@@ -435,6 +489,7 @@ impl<'a> ContextCompiler<'a> {
             dependency_paths,
             omissions,
             limitations,
+            conflicts,
             created_at,
         };
 
@@ -712,9 +767,10 @@ impl<'a> ContextCompiler<'a> {
         }))
     }
 
-    /// Evidence status for a candidate: stale if any dependent claim of the
-    /// symbol is stale, else `candidate` (TIS §8.1, FR-060: stale items are
-    /// carried visibly, never silently dropped).
+    /// Evidence status for a candidate: stale/conflicted when any dependent
+    /// claim of the symbol has that status, else `candidate` (TIS §8.1,
+    /// FR-060: freshness and conflicts are carried visibly, never silently
+    /// dropped).
     async fn evidence_status_for(&self, repository_id: RepositoryId, entity_id: &str) -> String {
         let Ok(symbol_id) = SymbolId::from_str(entity_id) else {
             return "candidate".into();
@@ -724,10 +780,72 @@ impl<'a> ContextCompiler<'a> {
             .claims_depending_on(repository_id, &[], &[symbol_id.to_string()])
             .await
         {
-            Ok(claims) if claims.iter().any(|c| c.status == ClaimStatus::Stale) => "stale".into(),
+            Ok(claims) => {
+                if claims.iter().any(|c| c.status == ClaimStatus::Conflicted) {
+                    "conflicted".into()
+                } else if claims.iter().any(|c| c.status == ClaimStatus::Stale) {
+                    "stale".into()
+                } else {
+                    "candidate".into()
+                }
+            }
             _ => "candidate".into(),
         }
     }
+
+    /// The bundle's conflicts section (FR-060): every conflict pair that
+    /// touches a selected (or high-value omitted) conflicted item, with both
+    /// sides and the shared scope. Deterministic: pairs are sorted by pair
+    /// id, and the section is omitted from the hash entirely when empty.
+    async fn conflict_section(
+        &self,
+        repository_id: RepositoryId,
+        selected: &[Candidate],
+        omissions: &[BundleOmission],
+    ) -> Result<Vec<BundleConflict>, CccError> {
+        let mut conflicted_ids: HashSet<String> = selected
+            .iter()
+            .filter(|c| c.evidence_status == "conflicted")
+            .map(|c| c.entity_id.clone())
+            .collect();
+        // Omitted conflicted items keep their omission record; they join the
+        // conflict section too so the omission is explained by its conflict.
+        for o in omissions {
+            if o.reason == "conflicting_evidence" {
+                conflicted_ids.insert(o.entity_id.clone());
+            }
+        }
+        if conflicted_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pairs =
+            ccc_memory::list_conflicts(self.evidence_store, self.memory_store, repository_id)
+                .await?;
+        let mut conflicts: Vec<BundleConflict> = pairs
+            .into_iter()
+            .filter(|p| conflicted_ids.contains(&p.left_id) || conflicted_ids.contains(&p.right_id))
+            .map(|p| BundleConflict {
+                conflict_id: conflict_pair_id(&p.left_id, &p.right_id),
+                entity_ids: vec![p.left_id, p.right_id],
+                titles: vec![p.left_title, p.right_title],
+                texts: vec![p.left_text, p.right_text],
+                shared_scope: p.shared_scope,
+                status: p.label,
+            })
+            .collect();
+        conflicts.sort_by(|a, b| a.conflict_id.cmp(&b.conflict_id));
+        Ok(conflicts)
+    }
+}
+
+/// Deterministic identity for a conflict pair (sorted entity ids, BLAKE3).
+fn conflict_pair_id(left_id: &str, right_id: &str) -> String {
+    let (a, b) = if left_id <= right_id {
+        (left_id, right_id)
+    } else {
+        (right_id, left_id)
+    };
+    blake3_hex(format!("{a}|{b}").as_bytes())
 }
 
 use std::str::FromStr as _;
@@ -750,6 +868,7 @@ fn features_for(c: &Candidate) -> Features {
         Channel::Lexical => 0.7,
         Channel::Dependency(_) => 0.4,
         Channel::Test => 0.3,
+        Channel::Memory => 0.7, // FTS-retrieved like the lexical channel
     };
     let d = match c.channel {
         Channel::Dependency(1) => 1.0,
@@ -759,13 +878,14 @@ fn features_for(c: &Candidate) -> Features {
         Channel::Symbol => 1.0,
         Channel::Lexical => 0.25,
         Channel::Test => 0.5,
+        Channel::Memory => 0.0, // memories are not in the dependency graph
     };
     let t = match c.channel {
         Channel::Test => 1.0,
         _ => 0.0,
     };
     let h = c.recency_millis as f64 / 1000.0; // reciprocal-rank recency (H)
-    let f = if c.evidence_status == "stale" {
+    let f = if c.evidence_status == "stale" || c.evidence_status == "conflicted" {
         0.0
     } else {
         1.0
@@ -774,6 +894,8 @@ fn features_for(c: &Candidate) -> Features {
         Channel::Symbol | Channel::Lexical => 0.9,
         Channel::Dependency(_) => 0.7,
         Channel::Test => 0.4,
+        // Memory is subordinate to current source and test results (TIS §12).
+        Channel::Memory => 0.5,
     };
     let x = (c.token_cost as f64 / 2048.0).clamp(0.0, 1.0); // normalized cost pressure
     Features {
@@ -830,6 +952,15 @@ fn select_within_budget(
     let mut remaining_budget = budget_tokens;
     let mut omissions: Vec<BundleOmission> = Vec::new();
     let mut any_budget_omission = false;
+    // FR-060: an omitted conflicted item is reported as such — the omission
+    // is explained by its conflict, never silently ranked away.
+    let omission_reason = |c: &Candidate, fallback: &str| -> String {
+        if c.evidence_status == "conflicted" {
+            "conflicting_evidence".into()
+        } else {
+            fallback.into()
+        }
+    };
 
     let mut start = 0usize;
     while start < ordered.len() {
@@ -859,7 +990,7 @@ fn select_within_budget(
                     path: c.path.clone(),
                     title: c.title.clone(),
                     score_millis: c.score_millis,
-                    reason: "budget_exceeded".into(),
+                    reason: omission_reason(c, "budget_exceeded"),
                 });
                 any_budget_omission = true;
             } else if selected_files.contains(&c.path) {
@@ -868,7 +999,7 @@ fn select_within_budget(
                     path: c.path.clone(),
                     title: c.title.clone(),
                     score_millis: c.score_millis,
-                    reason: "duplicate".into(),
+                    reason: omission_reason(c, "duplicate"),
                 });
             } else {
                 omissions.push(BundleOmission {
@@ -876,7 +1007,7 @@ fn select_within_budget(
                     path: c.path.clone(),
                     title: c.title.clone(),
                     score_millis: c.score_millis,
-                    reason: "lower_relevance".into(),
+                    reason: omission_reason(c, "lower_relevance"),
                 });
             }
         }
@@ -942,7 +1073,7 @@ mod tests {
     use ccc_indexer::run_index;
     use ccc_repository::GitCli;
     use ccc_snapshot::{find_or_create_snapshot, SnapshotBuilder};
-    use ccc_storage::test_support::InMemoryEvidenceStore;
+    use ccc_storage::test_support::{InMemoryEvidenceStore, InMemoryMemoryStore};
     use ccc_storage::{FsArtifactStore, SqliteStore};
     use std::path::Path;
     use std::process::Command;
@@ -973,6 +1104,7 @@ fn smoke_run_app() { run_app(); }
         store: Arc<SqliteStore>,
         artifacts: FsArtifactStore,
         evidence: InMemoryEvidenceStore,
+        memories: InMemoryMemoryStore,
         repo: RepositoryRecord,
         cfg: IndexingConfig,
     }
@@ -1011,6 +1143,7 @@ fn smoke_run_app() { run_app(); }
             store,
             artifacts,
             evidence,
+            memories: InMemoryMemoryStore::new(),
             repo,
             cfg,
         }
@@ -1074,6 +1207,7 @@ fn smoke_run_app() { run_app(); }
         let compiler = ContextCompiler::new(
             &*fx.store,
             &fx.evidence,
+            &fx.memories,
             &*fx.store,
             &fx.artifacts,
             &search_backend,
@@ -1118,6 +1252,7 @@ fn smoke_run_app() { run_app(); }
             dependency_paths: &bundle.dependency_paths,
             omissions: &bundle.omissions,
             limitations: &bundle.limitations,
+            conflicts: &bundle.conflicts,
         })
         .unwrap()
     }
@@ -1135,6 +1270,7 @@ fn smoke_run_app() { run_app(); }
         let compiler = ContextCompiler::new(
             &*fx.store,
             &fx.evidence,
+            &fx.memories,
             &*fx.store,
             &fx.artifacts,
             &search_backend,
@@ -1192,6 +1328,7 @@ fn smoke_run_app() { run_app(); }
         let compiler = ContextCompiler::new(
             &*fx.store,
             &fx.evidence,
+            &fx.memories,
             &*fx.store,
             &fx.artifacts,
             &search_backend,
@@ -1228,6 +1365,7 @@ fn smoke_run_app() { run_app(); }
         let compiler = ContextCompiler::new(
             &*fx.store,
             &fx.evidence,
+            &fx.memories,
             &*fx.store,
             &fx.artifacts,
             &search_backend,
@@ -1295,5 +1433,153 @@ fn smoke_run_app() { run_app(); }
             bundle_content_hash(&weighted_plain),
             "with a non-zero w_h the history data must influence selection"
         );
+    }
+
+    // -- Step 3: memory channel + conflict-aware bundles (FR-035/FR-060) ----
+
+    fn memory_record(
+        repo: RepositoryId,
+        snap: SnapshotId,
+        title: &str,
+        summary: &str,
+        status: ClaimStatus,
+    ) -> MemoryRecord {
+        let now = now_rfc3339();
+        MemoryRecord {
+            memory_id: MemoryId::generate(),
+            repository_id: repo,
+            snapshot_id: snap,
+            memory_type: MemoryType::FailedApproach,
+            title: title.into(),
+            summary: summary.into(),
+            scope: "src".into(),
+            created_by: "human:test".into(),
+            created_at: now.clone(),
+            last_accessed_at: now.clone(),
+            status,
+            sharing_policy: "private".into(),
+            sensitivity: "none".into(),
+            supersedes_memory_id: None,
+            stale_cause: None,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_channel_surfaces_labeled_memories_and_conflicts() {
+        let fx = fixture_with_files(&[("src/lib.rs", LIB), ("src/util.rs", UTIL)]).await;
+        index_fixture(&fx).await;
+        let repo_id = fx.repo.repository_id;
+
+        // No memories yet: the channel is silent and no conflicts section
+        // ships (byte-identical to the pre-memory bundle shape).
+        let search_backend = ccc_search::FtsSearchBackend::new(&*fx.store, &*fx.store, &*fx.store);
+        let compiler = ContextCompiler::new(
+            &*fx.store,
+            &fx.evidence,
+            &fx.memories,
+            &*fx.store,
+            &fx.artifacts,
+            &search_backend,
+            &HeuristicNormalizer,
+        );
+        let plain = compiler
+            .compile(&CompileRequest {
+                repository_id: repo_id,
+                task_text: "read_config caching".into(),
+                budget_tokens: 4000,
+                weights_override: None,
+                history_scores: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !plain.items.iter().any(|i| i.channel == "memory"),
+            "no memory items without memory records"
+        );
+        assert!(plain.conflicts.is_empty());
+
+        // Two disagreeing memories in the same scope + one stale memory.
+        let snap = SnapshotId::generate();
+        let a = memory_record(
+            repo_id,
+            snap,
+            "read_config caching",
+            "Cache the config per snapshot.",
+            ClaimStatus::Candidate,
+        );
+        let b = memory_record(
+            repo_id,
+            snap,
+            "read_config caching",
+            "Never cache the config; identity breaks.",
+            ClaimStatus::Candidate,
+        );
+        let stale = memory_record(
+            repo_id,
+            snap,
+            "read_config history",
+            "Older note about read_config behavior.",
+            ClaimStatus::Stale,
+        );
+        fx.memories.insert_memory(&a, &[]).await.unwrap();
+        fx.memories.insert_memory(&b, &[]).await.unwrap();
+        fx.memories.insert_memory(&stale, &[]).await.unwrap();
+        let report = ccc_memory::detect_conflicts(&fx.evidence, &fx.memories, repo_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.conflicted.len(),
+            1,
+            "memory pair detected: {report:?}"
+        );
+
+        let bundle = compiler
+            .compile(&CompileRequest {
+                repository_id: repo_id,
+                task_text: "read_config caching".into(),
+                budget_tokens: 4000,
+                weights_override: None,
+                history_scores: None,
+            })
+            .await
+            .unwrap();
+
+        // Memory items carry the explicit status label (SDD §9.5).
+        let memory_items: Vec<&BundleItem> = bundle
+            .items
+            .iter()
+            .filter(|i| i.channel == "memory")
+            .collect();
+        assert!(
+            memory_items
+                .iter()
+                .any(|i| i.evidence_status == "conflicted"),
+            "conflicted memory included with its label: {memory_items:?}"
+        );
+        assert!(
+            memory_items.iter().any(|i| i.evidence_status == "stale"),
+            "stale memory included with its label, never as current guidance"
+        );
+        // FR-060: the conflicts section carries both sides + scope.
+        assert_eq!(bundle.conflicts.len(), 1);
+        assert_eq!(bundle.conflicts[0].entity_ids.len(), 2);
+        assert_eq!(bundle.conflicts[0].status, "conflicted");
+        // Determinism: identical inputs → identical conflicts + hash.
+        let again = compiler
+            .compile(&CompileRequest {
+                repository_id: repo_id,
+                task_text: "read_config caching".into(),
+                budget_tokens: 4000,
+                weights_override: None,
+                history_scores: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(bundle.conflicts, again.conflicts);
+        assert_eq!(bundle_content_hash(&bundle), bundle_content_hash(&again));
+        // The markdown renders the conflicts section.
+        let md = bundle_markdown(&bundle);
+        assert!(md.contains("## Conflicts"));
     }
 }

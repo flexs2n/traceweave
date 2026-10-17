@@ -1,0 +1,35 @@
+# Memory-channel suite (Step 3, E-003): memory-retrieval cases over the
+# rust-sample fixture. Expectations pin memory TITLES (the memory channel
+# item title is the record title); code expectations are deliberately absent
+# so recall isolates the memory channel. Content-hash keyed and immutable —
+# edits create a new suite version and new recorded runs (ADR-008).
+#
+# The A/B in E-003 runs this suite twice with policy-v1 on both sides:
+# once before any memory records exist (empty channel) and once after
+# seeding the titled memories (channel active).
+
+name = "memory"
+
+[[cases]]
+task = "manifest caching identity"
+budget = 4000
+expect_symbols = ["manifest hashes"]
+expect_files = []
+forbidden_paths = ["vendor/dep.rs", "notes.md", "data.bin"]
+kind = "tuning"
+
+[[cases]]
+task = "smoke test run_app failure finding"
+budget = 4000
+expect_symbols = ["run_app failure"]
+expect_files = []
+forbidden_paths = ["vendor/dep.rs", "notes.md"]
+kind = "tuning"
+
+[[cases]]
+task = "config loader behavior note"
+budget = 3000
+expect_symbols = ["config loader behavior"]
+expect_files = []
+forbidden_paths = ["vendor/dep.rs", "notes.md"]
+kind = "held_out"

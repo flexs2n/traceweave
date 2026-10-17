@@ -1456,9 +1456,12 @@ impl MemoryStore for SqliteStore {
         if match_query.is_empty() {
             return Ok(Vec::new());
         }
+        // FR-036: retraction removes a record from active retrieval — it
+        // stays queryable only when explicitly requested by status.
         let mut clauses: Vec<String> = vec!["m.repository_id = ?".into()];
-        if status.is_some() {
-            clauses.push("m.status = ?".into());
+        match status {
+            Some(_) => clauses.push("m.status = ?".into()),
+            None => clauses.push("m.status != 'retracted'".into()),
         }
         if memory_type.is_some() {
             clauses.push("m.memory_type = ?".into());
@@ -2640,6 +2643,24 @@ mod tests {
             .unwrap();
         let touched = store.get_memory(memory.memory_id).await.unwrap().unwrap();
         assert_eq!(touched.last_accessed_at, "2026-10-17T00:00:00Z");
+
+        // FR-036: retraction removes the record from active retrieval.
+        let after_retract = store
+            .search_memories(repo.repository_id, "manifest", None, None, 10)
+            .await
+            .unwrap();
+        assert!(after_retract.is_empty(), "retracted records are not retrieved");
+        let explicit = store
+            .search_memories(
+                repo.repository_id,
+                "manifest",
+                Some(ClaimStatus::Retracted),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit.len(), 1, "explicit status query still finds it");
     }
 
     #[tokio::test]

@@ -780,6 +780,12 @@ impl MemoryStore for InMemoryMemoryStore {
             .memories
             .iter()
             .filter(|m| m.repository_id == repository_id)
+            // FR-036: retraction removes a record from active retrieval —
+            // queryable only when explicitly requested by status.
+            .filter(|m| match status {
+                Some(_) => true,
+                None => m.status != ClaimStatus::Retracted,
+            })
             .filter(|m| {
                 let haystack = format!("{} {}", m.title, m.summary).to_ascii_lowercase();
                 terms.iter().any(|t| haystack.contains(t.as_str()))

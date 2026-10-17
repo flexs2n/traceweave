@@ -42,3 +42,23 @@ expect_symbols = ["execute_check", "classify"]
 expect_files = ["crates/ccc-verification/src/executor.rs", "crates/ccc-verification/src/policy.rs"]
 forbidden_paths = ["target"]
 kind = "held_out"
+
+# Step 3 (E-004): memory-channel cases. Expectations pin seeded memory
+# titles ("Memory transitions keep history", "Conflict detection scope rule")
+# plus the real file behind them; modifying this suite creates a new
+# content-hash version and new recorded runs (ADR-008).
+[[cases]]
+task = "how do memory status transitions preserve history"
+budget = 4000
+expect_symbols = ["memory transitions"]
+expect_files = ["crates/ccc-memory/src/lib.rs"]
+forbidden_paths = ["target"]
+kind = "tuning"
+
+[[cases]]
+task = "how does contradiction detection share scope"
+budget = 4000
+expect_symbols = ["conflict detection scope"]
+expect_files = ["crates/ccc-memory/src/lib.rs"]
+forbidden_paths = ["target"]
+kind = "held_out"

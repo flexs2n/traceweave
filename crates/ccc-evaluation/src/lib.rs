@@ -220,11 +220,14 @@ impl<'a> EvalRunner<'a> {
     /// Runs every case of the suite against `repo`, records the suite (if new)
     /// and persists the immutable run record. Deterministic: identical
     /// (suite, policy, config) inputs produce identical metrics JSON.
+    /// `weights_override` carries an experiment's retrieval-policy weights
+    /// (ADR-008); `None` runs the current `policy-v1`.
     pub async fn run_suite(
         &self,
         repo: &RepositoryRecord,
         suite: &LoadedSuite,
         config_hash: &str,
+        weights_override: Option<&std::collections::BTreeMap<String, i64>>,
     ) -> Result<RunMetrics, CccError> {
         // Register the suite immutably (no-op when the hash is already known).
         let suite_json = serde_json::to_string(&suite.file)
@@ -239,8 +242,10 @@ impl<'a> EvalRunner<'a> {
             })
             .await?;
 
-        let weights = policy_weights_millis();
-        let policy_hash = hash_canonical(&weights)
+        let effective_weights: std::collections::BTreeMap<String, i64> = weights_override
+            .cloned()
+            .unwrap_or_else(policy_weights_millis);
+        let policy_hash = hash_canonical(&effective_weights)
             .map_err(|e| CccError::internal_error(format!("policy hash: {e}")))?;
         let compiler = ContextCompiler::new(
             self.index,
@@ -258,6 +263,7 @@ impl<'a> EvalRunner<'a> {
                     repository_id: repo.repository_id,
                     task_text: case.task.clone(),
                     budget_tokens: case.budget,
+                    weights_override: weights_override.cloned(),
                 })
                 .await?;
 
@@ -523,7 +529,7 @@ mod tests {
     }
 
     /// Local helper: builds a runner over the fixture's production pipeline
-    /// and runs one suite end to end.
+    /// and runs one suite end to end (current policy weights).
     macro_rules! eval_run {
         ($fx:expr, $evaluation:expr, $suite:expr) => {{
             let search = FtsSearchBackend::new(&*$fx.store, &*$fx.store, &*$fx.store);
@@ -535,7 +541,7 @@ mod tests {
                 &search,
                 $evaluation,
             )
-            .run_suite(&$fx.repo, $suite, "cfg-hash")
+            .run_suite(&$fx.repo, $suite, "cfg-hash", None)
             .await
         }};
     }

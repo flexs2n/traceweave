@@ -196,6 +196,7 @@ dependencies = [
  "ccc-config",
  "ccc-context-compiler",
  "ccc-domain",
+ "ccc-evaluation",
  "ccc-evidence",
  "ccc-impact",
  "ccc-indexer",
@@ -212,6 +213,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]

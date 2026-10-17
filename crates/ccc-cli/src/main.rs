@@ -2,9 +2,7 @@
 //!
 //! Human-readable output is the default; `--json` produces full,
 //! never-truncated machine envelopes. Errors exit non-zero with a stable
-//! error-code JSON on stderr. `ccc eval run` is declared-but-unimplemented in
-//! this build and says so explicitly instead of pretending availability
-//! (ui.md §3.2, no false availability).
+//! error-code JSON on stderr (ui.md §3.2: no false availability).
 
 use ccc_context_compiler::{CompileRequest, ContextCompiler, HeuristicNormalizer};
 use ccc_domain::*;
@@ -16,6 +14,7 @@ use ccc_search::{FtsSearchBackend, SearchBackend, SearchRequest};
 use ccc_snapshot::{find_or_create_snapshot, SnapshotBuilder};
 use ccc_storage::*;
 use clap::{Parser as ClapParser, Subcommand};
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -113,10 +112,16 @@ enum Command {
         #[command(subcommand)]
         command: PoliciesCommand,
     },
-    /// Offline evaluation (NOT IMPLEMENTED in this build).
+    /// Offline evaluation of the retrieval pipeline against a hashed suite
+    /// (SDD §20.2; deterministic, recorded immutably).
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
+    },
+    /// Snapshot manifest comparison (added/removed/changed/renamed paths).
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommand,
     },
 }
 
@@ -136,6 +141,14 @@ enum ContextCommand {
     },
     /// Inspect a persisted bundle.
     Show { bundle_id: String },
+    /// Compare two persisted bundles (post-change context refresh: item-level
+    /// added/removed/changed + evidence-status flips, SDD §11.4).
+    Diff {
+        /// Base bundle id.
+        bundle_a: String,
+        /// Target bundle id.
+        bundle_b: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,9 +190,30 @@ enum ImpactCommand {
 
 #[derive(Debug, Subcommand)]
 enum EvalCommand {
+    /// Run an evaluation suite (name resolved from ./eval/suites/ or the data
+    /// dir; a path is accepted directly).
     Run {
         #[arg(long)]
         suite: String,
+        /// Optional retrieval-policy override: a TOML file with a
+        /// `[weights]` table (ADR-008 experiments; runs stay recorded).
+        #[arg(long)]
+        policy: Option<String>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Show one recorded evaluation run.
+    Show { run_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommand {
+    /// Compare two snapshot manifests by id.
+    Diff {
+        /// Base snapshot id.
+        a: String,
+        /// Target snapshot id.
+        b: String,
     },
 }
 
@@ -223,9 +257,6 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
             PoliciesCommand::List => cmd_policies_list(&data_dir, cli.json).await,
             PoliciesCommand::Show { name } => cmd_policies_show(&data_dir, name, cli.json).await,
         },
-        Command::Eval { .. } => Err(CccError::invalid_request(
-            "evaluation is not implemented in this build",
-        )),
         // Everything below requires an initialized store.
         _ => {
             let store = open_store(&data_dir).await?;
@@ -289,6 +320,9 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
                     ContextCommand::Show { bundle_id } => {
                         cmd_context_show(&store, bundle_id, cli.json).await
                     }
+                    ContextCommand::Diff { bundle_a, bundle_b } => {
+                        cmd_context_diff(&store, bundle_a, bundle_b, cli.json).await
+                    }
                 },
                 Command::Evidence { command } => match command {
                     EvidenceCommand::Show { evidence_id } => {
@@ -317,6 +351,30 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
                 Command::Export { output, repo } => {
                     cmd_export(&store, repo.as_deref(), output, cli.json).await
                 }
+                Command::Eval { command } => match command {
+                    EvalCommand::Run {
+                        suite,
+                        policy,
+                        repo,
+                    } => {
+                        cmd_eval_run(
+                            &store,
+                            &artifacts,
+                            &data_dir,
+                            repo.as_deref(),
+                            suite,
+                            policy.as_deref(),
+                            cli.json,
+                        )
+                        .await
+                    }
+                    EvalCommand::Show { run_id } => cmd_eval_show(&store, run_id, cli.json).await,
+                },
+                Command::Snapshot { command } => match command {
+                    SnapshotCommand::Diff { a, b } => {
+                        cmd_snapshot_diff(&store, a, b, cli.json).await
+                    }
+                },
                 Command::Verify {
                     base,
                     head,
@@ -874,6 +932,7 @@ async fn cmd_context_compile(
             repository_id: repo.repository_id,
             task_text: task.to_string(),
             budget_tokens: budget,
+            weights_override: None,
         })
         .await
     {
@@ -1230,6 +1289,448 @@ async fn cmd_policies_show(
                 "disabled"
             }
         );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// evaluation (SDD §20.2, TIS §19)
+// ---------------------------------------------------------------------------
+
+/// A retrieval-policy override file: a `[weights]` table with the policy
+/// weight names (ADR-008 — experiments are recorded, never silent edits).
+#[derive(Debug, Deserialize)]
+struct WeightsFile {
+    weights: std::collections::BTreeMap<String, i64>,
+}
+
+const KNOWN_WEIGHTS: [&str; 7] = ["w_l", "w_d", "w_t", "w_h", "w_f", "w_r", "w_x"];
+
+fn load_weights_override(
+    path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, i64>, CccError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        CccError::invalid_request(format!(
+            "cannot read policy override {}: {e}",
+            path.display()
+        ))
+    })?;
+    let file: WeightsFile = toml::from_str(&raw).map_err(|e| {
+        CccError::invalid_request(format!(
+            "invalid policy override {} (expected a [weights] table): {e}",
+            path.display()
+        ))
+    })?;
+    for key in file.weights.keys() {
+        if !KNOWN_WEIGHTS.contains(&key.as_str()) {
+            return Err(CccError::invalid_request(format!(
+                "policy override {} has unknown weight {key:?}; known: {KNOWN_WEIGHTS:?}",
+                path.display()
+            )));
+        }
+    }
+    Ok(file.weights)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_eval_run(
+    store: &Arc<SqliteStore>,
+    artifacts: &FsArtifactStore,
+    data_dir: &std::path::Path,
+    repo_path: Option<&std::path::Path>,
+    suite_name: &str,
+    policy_path: Option<&str>,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let cfg = ccc_config::load_config(data_dir)?;
+    let config_hash = cfg.indexing().configuration_hash()?;
+    let suite_path = ccc_evaluation::resolve_suite_path(data_dir, suite_name)?;
+    let suite = ccc_evaluation::load_suite(&suite_path)?;
+    let weights_override = match policy_path {
+        Some(p) => Some(load_weights_override(std::path::Path::new(p))?),
+        None => None,
+    };
+    // The effective weights hash rides in the idempotency key so an A/B
+    // experiment with different weights is a distinct logical job.
+    let weights_hash = match &weights_override {
+        Some(w) => ccc_schema::hash_canonical(w)
+            .map_err(|e| CccError::internal_error(format!("weights hash: {e}")))?,
+        None => "current".into(),
+    };
+    let key = jobs::idempotency_key(&[
+        "eval_run",
+        &repo.repository_id.to_string(),
+        &suite.suite_hash,
+        &config_hash,
+        &weights_hash,
+    ]);
+    let job = jobs::begin_job(&**store, repo.repository_id, "eval_run", &key, None).await?;
+
+    let search = FtsSearchBackend::new(&**store, &**store, &**store);
+    let runner =
+        ccc_evaluation::EvalRunner::new(&**store, &**store, &**store, artifacts, &search, &**store);
+    match runner
+        .run_suite(&repo, &suite, &config_hash, weights_override.as_ref())
+        .await
+    {
+        Ok(metrics) => {
+            let run = store
+                .list_runs(repo.repository_id)
+                .await?
+                .into_iter()
+                .last()
+                .ok_or_else(|| CccError::internal_error("run record missing after eval run"))?;
+            let _job = if job.state.is_terminal() {
+                // Idempotent replay: the logical job already completed.
+                job
+            } else {
+                jobs::finish_success(&**store, job, Some(&run.run_id.to_string())).await?
+            };
+            if json {
+                print_json(&envelope(
+                    &serde_json::json!({
+                        "run_id": run.run_id.to_string(),
+                        "metrics": metrics,
+                    }),
+                    meta_for(&repo, None, None),
+                )?)?;
+            } else {
+                println!(
+                    "Evaluation run {} — suite {:?} (hash {})",
+                    run.run_id, metrics.suite_name, metrics.suite_hash
+                );
+                println!(
+                    "Policy: {} (hash {}), config: {}",
+                    metrics.retrieval_policy_version, metrics.policy_hash, metrics.config_hash
+                );
+                for group in ["tuning", "held_out"] {
+                    let g = if group == "tuning" {
+                        &metrics.tuning
+                    } else {
+                        &metrics.held_out
+                    };
+                    if g.cases == 0 {
+                        continue;
+                    }
+                    println!(
+                        "{group}: {} case(s) — recall {}‰, MRR {}‰, precision@{} {}‰, \
+                         stale {}‰, token cost {}",
+                        g.cases,
+                        g.recall_millis / 10,
+                        g.mrr_millis / 10,
+                        ccc_evaluation::PRECISION_K,
+                        g.precision_millis / 10,
+                        g.stale_rate_millis / 10,
+                        g.token_cost
+                    );
+                }
+                for case in &metrics.cases {
+                    println!(
+                        "  case {} [{}] — items: {}, matched: {}/{} (recall {}‰), stale {}‰, tokens {}",
+                        case.case_index,
+                        case.kind,
+                        case.items,
+                        case.matched,
+                        case.expected,
+                        case.recall_millis / 10,
+                        case.stale_rate_millis / 10,
+                        case.estimated_tokens
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            jobs::finish_failure(&**store, job, &e).await?;
+            Err(e)
+        }
+    }
+}
+
+async fn cmd_eval_show(store: &SqliteStore, run_id: &str, json: bool) -> Result<(), CccError> {
+    let id = EvaluationRunId::from_str(run_id)
+        .map_err(|_| CccError::invalid_request(format!("invalid run id {run_id:?}")))?;
+    let record = store.get_run(id).await?.ok_or_else(|| {
+        CccError::snapshot_not_found(format!("evaluation run {run_id} not found"))
+    })?;
+    let metrics: serde_json::Value =
+        serde_json::from_str(&record.metrics_json).unwrap_or(serde_json::json!({}));
+    if json {
+        print_json(&envelope(
+            &serde_json::json!({
+                "run_id": record.run_id.to_string(),
+                "suite_name": record.suite_name,
+                "suite_hash": record.suite_hash,
+                "policy_version": record.policy_version,
+                "policy_hash": record.policy_hash,
+                "config_hash": record.config_hash,
+                "created_at": record.created_at,
+                "metrics": metrics,
+            }),
+            EnvelopeMeta::default(),
+        )?)?;
+    } else {
+        println!("Evaluation run {}", record.run_id);
+        println!(
+            "  suite: {} (hash {})",
+            record.suite_name, record.suite_hash
+        );
+        println!(
+            "  policy: {} (hash {}), config: {}",
+            record.policy_version, record.policy_hash, record.config_hash
+        );
+        println!("  created: {}", record.created_at);
+        println!(
+            "  metrics: {}",
+            serde_json::to_string_pretty(&metrics).unwrap_or_else(|_| record.metrics_json.clone())
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// snapshot + context diff (PRD Phase 2, SDD §11.4)
+// ---------------------------------------------------------------------------
+
+async fn cmd_snapshot_diff(
+    store: &SqliteStore,
+    a: &str,
+    b: &str,
+    json: bool,
+) -> Result<(), CccError> {
+    let id_a = SnapshotId::from_str(a)
+        .map_err(|_| CccError::invalid_request(format!("invalid snapshot id {a:?}")))?;
+    let id_b = SnapshotId::from_str(b)
+        .map_err(|_| CccError::invalid_request(format!("invalid snapshot id {b:?}")))?;
+    store
+        .get_snapshot(id_a)
+        .await?
+        .ok_or_else(|| CccError::snapshot_not_found(format!("snapshot {a} not found")))?;
+    store
+        .get_snapshot(id_b)
+        .await?
+        .ok_or_else(|| CccError::snapshot_not_found(format!("snapshot {b} not found")))?;
+
+    let files_a = store.list_files(id_a).await?;
+    let files_b = store.list_files(id_b).await?;
+    let map_a: std::collections::HashMap<&str, &str> = files_a
+        .iter()
+        .map(|f| (f.path.as_str(), f.content_hash.as_str()))
+        .collect();
+    let map_b: std::collections::HashMap<&str, &str> = files_b
+        .iter()
+        .map(|f| (f.path.as_str(), f.content_hash.as_str()))
+        .collect();
+
+    let mut added: Vec<String> = Vec::new();
+    let mut changed: Vec<serde_json::Value> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    // Renames: a removed path and an added path sharing identical content.
+    let mut renamed: Vec<serde_json::Value> = Vec::new();
+    let mut consumed_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut removed_paths: Vec<&str> = map_a
+        .iter()
+        .filter(|(p, _)| !map_b.contains_key(*p))
+        .map(|(p, _)| *p)
+        .collect();
+    removed_paths.sort();
+    let mut added_paths: Vec<&str> = map_b
+        .iter()
+        .filter(|(p, _)| !map_a.contains_key(*p))
+        .map(|(p, _)| *p)
+        .collect();
+    added_paths.sort();
+    for old in &removed_paths {
+        let hash = map_a[*old];
+        if let Some(new) = added_paths
+            .iter()
+            .find(|c| map_b[**c] == hash && !consumed_targets.contains(**c))
+        {
+            consumed_targets.insert((*new).to_string());
+            renamed.push(serde_json::json!({ "from": old, "to": new }));
+        } else {
+            removed.push((*old).to_string());
+        }
+    }
+    for path in added_paths {
+        if !consumed_targets.contains(path) {
+            added.push(path.to_string());
+        }
+    }
+    for (path, hash) in &map_a {
+        if let Some(other) = map_b.get(*path) {
+            if other != hash {
+                changed.push(serde_json::json!({ "path": path, "from": hash, "to": other }));
+            }
+        }
+    }
+    added.sort();
+    removed.sort();
+    changed.sort_by(|x, y| {
+        x["path"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(y["path"].as_str().unwrap_or_default())
+    });
+    renamed.sort_by(|x, y| {
+        x["from"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(y["from"].as_str().unwrap_or_default())
+    });
+
+    if json {
+        print_json(&envelope(
+            &serde_json::json!({
+                "base_snapshot": a,
+                "target_snapshot": b,
+                "added": added,
+                "removed": removed,
+                "changed": changed,
+                "renamed": renamed,
+            }),
+            EnvelopeMeta::default(),
+        )?)?;
+    } else {
+        println!("Snapshot diff {a} → {b}");
+        println!("added: {}", added.len());
+        for entry in &added {
+            println!("  + {entry}");
+        }
+        println!("removed: {}", removed.len());
+        for entry in &removed {
+            println!("  - {entry}");
+        }
+        println!("changed: {}", changed.len());
+        for c in &changed {
+            println!(
+                "  ~ {} ({} → {})",
+                c["path"].as_str().unwrap_or_default(),
+                c["from"].as_str().unwrap_or_default(),
+                c["to"].as_str().unwrap_or_default()
+            );
+        }
+        println!("renamed: {}", renamed.len());
+        for r in &renamed {
+            println!(
+                "  {} → {}",
+                r["from"].as_str().unwrap_or_default(),
+                r["to"].as_str().unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_context_diff(
+    store: &SqliteStore,
+    a: &str,
+    b: &str,
+    json: bool,
+) -> Result<(), CccError> {
+    let id_a = BundleId::from_str(a)
+        .map_err(|_| CccError::invalid_request(format!("invalid bundle id {a:?}")))?;
+    let id_b = BundleId::from_str(b)
+        .map_err(|_| CccError::invalid_request(format!("invalid bundle id {b:?}")))?;
+    let bundle_a = store
+        .get_bundle(id_a)
+        .await?
+        .ok_or_else(|| CccError::snapshot_not_found(format!("bundle {a} not found")))?;
+    let bundle_b = store
+        .get_bundle(id_b)
+        .await?
+        .ok_or_else(|| CccError::snapshot_not_found(format!("bundle {b} not found")))?;
+    let items_a: Vec<ccc_schema::BundleItem> =
+        serde_json::from_str(&store.get_bundle_items(id_a).await?).unwrap_or_default();
+    let items_b: Vec<ccc_schema::BundleItem> =
+        serde_json::from_str(&store.get_bundle_items(id_b).await?).unwrap_or_default();
+
+    // Join key is the logical identity (kind + path + title), stable across
+    // snapshot-scoped entity ids — a reindex regenerates ids, not items.
+    let by_item = |items: &[ccc_schema::BundleItem]| {
+        items
+            .iter()
+            .map(|i| (format!("{}|{}|{}", i.item_kind, i.path, i.title), i.clone()))
+            .collect::<std::collections::HashMap<String, ccc_schema::BundleItem>>()
+    };
+    let map_a = by_item(&items_a);
+    let map_b = by_item(&items_b);
+
+    let added: Vec<&ccc_schema::BundleItem> = items_b
+        .iter()
+        .filter(|i| !map_a.contains_key(&format!("{}|{}|{}", i.item_kind, i.path, i.title)))
+        .collect();
+    let removed: Vec<&ccc_schema::BundleItem> = items_a
+        .iter()
+        .filter(|i| !map_b.contains_key(&format!("{}|{}|{}", i.item_kind, i.path, i.title)))
+        .collect();
+    let mut changed: Vec<serde_json::Value> = Vec::new();
+    for item in &items_b {
+        let key = format!("{}|{}|{}", item.item_kind, item.path, item.title);
+        if let Some(old) = map_a.get(&key) {
+            let content_changed = old.provenance.content_hash != item.provenance.content_hash;
+            let status_changed = old.evidence_status != item.evidence_status;
+            if content_changed || status_changed {
+                changed.push(serde_json::json!({
+                    "entity_id": item.entity_id,
+                    "title": item.title,
+                    "path": item.path,
+                    "content_changed": content_changed,
+                    "evidence_status": {
+                        "from": old.evidence_status,
+                        "to": item.evidence_status,
+                    },
+                }));
+            }
+        }
+    }
+
+    if json {
+        print_json(&envelope(
+            &serde_json::json!({
+                "bundle_a": a,
+                "bundle_b": b,
+                "added": added,
+                "removed": removed,
+                "changed": changed,
+            }),
+            EnvelopeMeta::default(),
+        )?)?;
+    } else {
+        println!(
+            "Context diff {} → {}",
+            bundle_a.bundle_id, bundle_b.bundle_id
+        );
+        println!("added ({}):", added.len());
+        for i in &added {
+            println!(
+                "  + {} ({}, evidence: {})",
+                i.title, i.path, i.evidence_status
+            );
+        }
+        println!("removed ({}):", removed.len());
+        for i in &removed {
+            println!(
+                "  - {} ({}, evidence: {})",
+                i.title, i.path, i.evidence_status
+            );
+        }
+        println!("changed ({}):", changed.len());
+        for c in &changed {
+            println!(
+                "  ~ {} — evidence: {} → {}{}",
+                c["title"].as_str().unwrap_or_default(),
+                c["evidence_status"]["from"].as_str().unwrap_or_default(),
+                c["evidence_status"]["to"].as_str().unwrap_or_default(),
+                if c["content_changed"].as_bool().unwrap_or(false) {
+                    " (content changed)"
+                } else {
+                    ""
+                }
+            );
+        }
     }
     Ok(())
 }

@@ -161,7 +161,6 @@ fn golden_vertical_path() {
         .unwrap()
         .to_string();
     let snapshot_id = index1["data"]["snapshot_id"].as_str().unwrap().to_string();
-    let _ = snapshot_id;
 
     // status — exclusions visible, unsupported listed.
     let status = cli.json(&["status"]);
@@ -197,6 +196,20 @@ fn golden_vertical_path() {
         "excluded content never in search results"
     );
 
+    // context compile BEFORE the change (baseline for the context diff).
+    let compile_pre = cli.json(&[
+        "context",
+        "compile",
+        "--task",
+        "how does read_config get called",
+        "--budget",
+        "3000",
+    ]);
+    let pre_bundle_id = compile_pre["data"]["bundle_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
     // modify ONE file, commit, reindex: exactly one reparse.
     std::fs::write(
         cli.repo_dir.join("src/util.rs"),
@@ -218,6 +231,18 @@ fn golden_vertical_path() {
         2,
         "unchanged files reused"
     );
+    let snapshot_id_2 = index2["data"]["snapshot_id"].as_str().unwrap().to_string();
+
+    // snapshot diff — the manifest comparison sees exactly the changed path.
+    let snap_diff = cli.json(&["snapshot", "diff", &snapshot_id, &snapshot_id_2]);
+    assert_eq!(
+        snap_diff["data"]["changed"].as_array().unwrap().len(),
+        1,
+        "one changed path: {snap_diff:?}"
+    );
+    assert_eq!(snap_diff["data"]["changed"][0]["path"], "src/util.rs");
+    assert_eq!(snap_diff["data"]["added"].as_array().unwrap().len(), 0);
+    assert_eq!(snap_diff["data"]["removed"].as_array().unwrap().len(), 0);
 
     // context compile — deterministic bundle_hash across identical invocations.
     let compile1 = cli.json(&[
@@ -250,6 +275,55 @@ fn golden_vertical_path() {
     );
     // Every machine output carries snapshot identity.
     assert!(compile1["meta"]["repository_id"].as_str().is_some());
+
+    // context diff — post-change refresh visibility: items changed content
+    // and flipped evidence status (candidate → stale after the reindex).
+    let post_bundle_id = compile1["data"]["bundle_id"].as_str().unwrap().to_string();
+    let ctx_diff = cli.json(&["context", "diff", &pre_bundle_id, &post_bundle_id]);
+    let changed = ctx_diff["data"]["changed"].as_array().unwrap();
+    assert!(
+        changed
+            .iter()
+            .any(|c| c["path"] == "src/util.rs" && c["content_changed"] == true),
+        "the changed file surfaces in the bundle diff: {changed:?}"
+    );
+    assert!(
+        changed
+            .iter()
+            .any(|c| c["evidence_status"]["from"] == "candidate"
+                && c["evidence_status"]["to"] == "stale"),
+        "evidence-status flips are visible (SDD §11.4)"
+    );
+
+    // eval run — the fixture suite is deterministic: two identical runs
+    // produce identical metrics; the suite hash pins the dataset.
+    let suite_path = std::fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/suites/fixture.toml"),
+    )
+    .unwrap();
+    let suite_arg = suite_path.to_str().unwrap();
+    let eval1 = cli.json(&["eval", "run", "--suite", suite_arg]);
+    let eval2 = cli.json(&["eval", "run", "--suite", suite_arg]);
+    assert_eq!(eval1["data"]["metrics"], eval2["data"]["metrics"]);
+    let run_id = eval1["data"]["run_id"].as_str().unwrap().to_string();
+    assert!(
+        eval1["data"]["metrics"]["tuning"]["recall_millis"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "golden expectations are actually retrieved: {eval1:?}"
+    );
+    assert_eq!(eval1["data"]["metrics"]["tuning"]["cases"], 2);
+    assert_eq!(eval1["data"]["metrics"]["held_out"]["cases"], 1);
+    assert!(eval1["data"]["metrics"]["suite_hash"].as_str().is_some());
+    assert_eq!(
+        eval1["data"]["metrics"]["retrieval_policy_version"],
+        "policy-v1"
+    );
+
+    // eval show — the recorded run is queryable with identical metrics.
+    let eval_show = cli.json(&["eval", "show", &run_id]);
+    assert_eq!(eval_show["data"]["metrics"], eval1["data"]["metrics"]);
 
     // impact analyze — caller of changed function reported with a path.
     let impact = cli.json(&["impact", "analyze", "--base", "HEAD~1", "--head", "HEAD"]);

@@ -184,6 +184,10 @@ pub struct CompileRequest {
     pub repository_id: RepositoryId,
     pub task_text: String,
     pub budget_tokens: u64,
+    /// Optional retrieval-policy override (ADR-008 experiments). When absent,
+    /// the current `policy_weights_millis()` apply; overrides are recorded in
+    /// the bundle's `weights_millis` so every bundle carries its policy.
+    pub weights_override: Option<BTreeMap<String, i64>>,
 }
 
 pub struct ContextCompiler<'a> {
@@ -301,7 +305,10 @@ impl<'a> ContextCompiler<'a> {
         }
 
         // Ranking (TIS §9.3): S(c) = w_l·L + w_d·D + w_t·T + w_h·H + w_f·F + w_r·R − w_x·X.
-        let weights = policy_weights_millis();
+        let weights = request
+            .weights_override
+            .clone()
+            .unwrap_or_else(policy_weights_millis);
         for c in &mut candidates {
             let f = features_for(c);
             let w = |k: &str| weights.get(k).copied().unwrap_or(0) as f64 / 1000.0;
@@ -1039,6 +1046,7 @@ fn smoke_run_app() { run_app(); }
             repository_id: fx.repo.repository_id,
             task_text: "how does read_config get called".into(),
             budget_tokens: 2000,
+            weights_override: None,
         };
         let first = compiler.compile(&request).await.unwrap();
         let second = compiler.compile(&request).await.unwrap();
@@ -1098,6 +1106,7 @@ fn smoke_run_app() { run_app(); }
             repository_id: fx.repo.repository_id,
             task_text: "read_config run_app smoke".into(),
             budget_tokens: 40,
+            weights_override: None,
         };
         let bundle = compiler.compile(&request).await.unwrap();
         assert!(
@@ -1154,6 +1163,7 @@ fn smoke_run_app() { run_app(); }
                 repository_id: fx.repo.repository_id,
                 task_text: "read_config".into(),
                 budget_tokens: 4000,
+                weights_override: None,
             })
             .await
             .unwrap();

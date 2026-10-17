@@ -17,6 +17,7 @@ ccc-storage = { workspace = true }
 ccc-indexer = { workspace = true }
 ccc-search = { workspace = true }
 ccc-evidence = { workspace = true }
+ccc-memory = { workspace = true }
 ccc-context-compiler = { workspace = true }
 ccc-impact = { workspace = true }
 ccc-verification = { workspace = true }

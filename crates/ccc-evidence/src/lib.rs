@@ -73,6 +73,7 @@ pub async fn record_symbol_facts(
             created_at: now.clone(),
             validated_at: None,
             updated_at: now.clone(),
+            supersedes_claim_id: None,
         };
         links.push(ClaimDependencyRecord {
             claim_id: claim.claim_id,

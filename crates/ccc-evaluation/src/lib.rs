@@ -19,7 +19,9 @@ use ccc_context_compiler::{
 use ccc_domain::*;
 use ccc_schema::{hash_canonical, SCHEMA_VERSION};
 use ccc_search::SearchBackend;
-use ccc_storage::{ArtifactStore, BundleStore, EvaluationStore, EvidenceStore, IndexStore};
+use ccc_storage::{
+    ArtifactStore, BundleStore, EvaluationStore, EvidenceStore, IndexStore, MemoryStore,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -191,6 +193,7 @@ pub struct RunMetrics {
 pub struct EvalRunner<'a> {
     index: &'a dyn IndexStore,
     evidence: &'a dyn EvidenceStore,
+    memories: &'a dyn MemoryStore,
     bundles: &'a dyn BundleStore,
     artifacts: &'a dyn ArtifactStore,
     search: &'a dyn SearchBackend,
@@ -202,6 +205,7 @@ impl<'a> EvalRunner<'a> {
     pub fn new(
         index: &'a dyn IndexStore,
         evidence: &'a dyn EvidenceStore,
+        memories: &'a dyn MemoryStore,
         bundles: &'a dyn BundleStore,
         artifacts: &'a dyn ArtifactStore,
         search: &'a dyn SearchBackend,
@@ -210,6 +214,7 @@ impl<'a> EvalRunner<'a> {
         Self {
             index,
             evidence,
+            memories,
             bundles,
             artifacts,
             search,
@@ -259,6 +264,7 @@ impl<'a> EvalRunner<'a> {
         let compiler = ContextCompiler::new(
             self.index,
             self.evidence,
+            self.memories,
             self.bundles,
             self.artifacts,
             self.search,
@@ -547,6 +553,7 @@ mod tests {
                 &*$fx.store,
                 &*$fx.store,
                 &*$fx.store,
+                &*$fx.store,
                 &$fx.artifacts,
                 &search,
                 $evaluation,
@@ -828,6 +835,7 @@ mod tests {
                 &*fx.store,
                 &*fx.store,
                 &*fx.store,
+                &*fx.store,
                 &fx.artifacts,
                 &search,
                 &fx.evaluation,
@@ -855,6 +863,7 @@ mod tests {
         let v2_again = {
             let search = FtsSearchBackend::new(&*fx.store, &*fx.store, &*fx.store);
             EvalRunner::new(
+                &*fx.store,
                 &*fx.store,
                 &*fx.store,
                 &*fx.store,

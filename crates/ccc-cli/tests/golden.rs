@@ -413,3 +413,291 @@ fn golden_vertical_path() {
     let _ = Duration::from_secs(0);
     let _ = bad; // limit 0 is clamped, not an error; covered by verify/eval above.
 }
+
+/// Step 3 golden flow (plan T4/T9): memory add → search → conflicts →
+/// conflict-aware bundle → resolve → supersede → freshness after reindex.
+/// Memory stays subordinate: agent-free here, and every stale/conflicted
+/// memory is explicitly labeled (SDD §9.5).
+#[test]
+fn golden_memory_and_conflict_flow() {
+    let temp = tempfile::tempdir().unwrap();
+    let cli = Cli {
+        data_dir: temp.path().join("data"),
+        repo_dir: seed_repo(temp.path()),
+    };
+    assert!(cli.run(&["init"]).status.success());
+    cli.json(&["repo", "add", cli.repo_dir.to_str().unwrap()]);
+    cli.json(&["index"]);
+
+    // A claim from the indexer (symbol_existence) to link a memory to — the
+    // util.rs claim, so the later reindex of util.rs exercises the
+    // freshness projection (FR-043).
+    let claims = cli.json(&["evidence", "list", "--status", "candidate"]);
+    let claim_rows = claims["data"].as_array().unwrap();
+    assert!(!claim_rows.is_empty(), "indexing produced claims");
+    let claim_id = claim_rows
+        .iter()
+        .find(|c| {
+            c["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("read_config"))
+        })
+        .map(|c| c["claim_id"].as_str().unwrap().to_string())
+        .expect("a read_config claim exists");
+
+    // memory add — starts candidate with provenance (FR-032).
+    let added = cli.json(&[
+        "memory",
+        "add",
+        "--title",
+        "Do not cache manifest hashes",
+        "--summary",
+        "Caching the manifest hash broke snapshot identity once.",
+        "--memory-type",
+        "failed_approach",
+        "--scope",
+        "src",
+        "--created-by",
+        "human:test",
+        "--claim-id",
+        &claim_id,
+    ]);
+    let memory_id = added["data"]["memory_id"].as_str().unwrap().to_string();
+    assert_eq!(added["data"]["status"], "candidate");
+
+    // Unknown claim ids are rejected (no false availability).
+    let unknown_claim = cli.run(&[
+        "--json",
+        "memory",
+        "add",
+        "--title",
+        "t",
+        "--summary",
+        "s",
+        "--memory-type",
+        "invariant",
+        "--created-by",
+        "human:test",
+        "--claim-id",
+        "00000000-0000-7000-8000-000000000000",
+    ]);
+    assert!(!unknown_claim.status.success());
+    assert_eq!(stderr_code(&unknown_claim), "SNAPSHOT_NOT_FOUND");
+
+    // Unknown memory types are INVALID_REQUEST.
+    let bad_type = cli.run(&[
+        "--json",
+        "memory",
+        "add",
+        "--title",
+        "t",
+        "--summary",
+        "s",
+        "--memory-type",
+        "best_practice",
+        "--created-by",
+        "human:test",
+    ]);
+    assert!(!bad_type.status.success());
+    assert_eq!(stderr_code(&bad_type), "INVALID_REQUEST");
+
+    // search (FR-035) — FTS over title+summary.
+    let found = cli.json(&["memory", "search", "manifest caching"]);
+    let hits = found["data"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["memory_id"], memory_id.as_str());
+
+    // show — claim link + touch of last_accessed_at.
+    let shown = cli.json(&["memory", "show", &memory_id]);
+    assert_eq!(shown["data"]["claim_ids"][0], claim_id.as_str());
+
+    // Conflict-aware compilation (FR-060): the memory channel surfaces the
+    // memory item before any conflict exists.
+    let bundle_plain = cli.json(&[
+        "context",
+        "compile",
+        "--task",
+        "manifest caching identity",
+        "--budget",
+        "4000",
+    ]);
+    assert!(
+        bundle_plain["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["channel"] == "memory" && i["evidence_status"] == "candidate"),
+        "memory channel surfaces the record: {bundle_plain:?}"
+    );
+
+    // Two disagreeing memories in the same scope → both conflicted (FR-034).
+    let contradict = cli.json(&[
+        "memory",
+        "add",
+        "--title",
+        "Do not cache manifest hashes",
+        "--summary",
+        "Always cache the manifest hash; it is content-addressed.",
+        "--memory-type",
+        "failed_approach",
+        "--scope",
+        "src",
+        "--created-by",
+        "human:other",
+    ]);
+    let other_id = contradict["data"]["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conflicts = cli.json(&["conflicts"]);
+    let pairs = conflicts["data"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "one conflict pair: {conflicts:?}");
+    assert_eq!(pairs[0]["label"], "conflicted");
+    assert_eq!(pairs[0]["left_id"], memory_id.as_str());
+    assert_eq!(pairs[0]["right_id"], other_id.as_str());
+    assert_eq!(
+        pairs[0]["left_text"],
+        "Caching the manifest hash broke snapshot identity once."
+    );
+    assert_eq!(
+        pairs[0]["right_text"],
+        "Always cache the manifest hash; it is content-addressed."
+    );
+
+    // A bundle whose task touches the conflicted memories carries the
+    // conflicts section with both sides — never a silent preference.
+    let bundle_conflict = cli.json(&[
+        "context",
+        "compile",
+        "--task",
+        "manifest caching identity",
+        "--budget",
+        "4000",
+    ]);
+    let bundle_conflicts = bundle_conflict["data"]["conflicts"]
+        .as_array()
+        .expect("conflicts section present");
+    assert_eq!(bundle_conflicts.len(), 1);
+    assert_eq!(bundle_conflicts[0]["status"], "conflicted");
+    assert_eq!(
+        bundle_conflicts[0]["entity_ids"].as_array().unwrap().len(),
+        2
+    );
+
+    // Freshness (FR-043): the linked claim goes stale after a reindex → the
+    // memory flips stale with a cause; unrelated memories stay candidate.
+    std::fs::write(
+        cli.repo_dir.join("src/util.rs"),
+        "pub fn read_config() -> u8 {\n    42\n}\n",
+    )
+    .unwrap();
+    git(&cli.repo_dir, &["add", "-A"]);
+    git(&cli.repo_dir, &["commit", "-m", "change util"]);
+    let index = cli.json(&["index"]);
+    assert!(
+        index["data"]["memories_flipped_stale"].as_u64().unwrap() >= 1,
+        "the freshness projection reported the stale memory: {index:?}"
+    );
+    let stale = cli.json(&["memory", "list", "--status", "stale"]);
+    let stale_rows = stale["data"].as_array().unwrap();
+    assert!(stale_rows
+        .iter()
+        .any(|m| m["memory_id"] == memory_id.as_str()));
+    // Selective: the contradicting memory (no linked claims) was flipped
+    // `conflicted` by detection earlier and stays untouched by the
+    // invalidation — freshness follows linked claims only.
+    let still_conflicted = cli.json(&["memory", "list", "--status", "conflicted"]);
+    assert!(
+        still_conflicted["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["memory_id"] == other_id.as_str()),
+        "the other memory kept its conflicted status"
+    );
+
+    // Human resolution (SDD §9.4 steps 7–8): loser retracted, rationale kept.
+    let resolved = cli.json(&[
+        "memory",
+        "resolve",
+        "--keep",
+        &other_id,
+        "--drop",
+        &memory_id,
+        "--rationale",
+        "caching is safe; verified by test",
+        "--actor",
+        "human:test",
+    ]);
+    assert_eq!(resolved["data"]["outcome"], "retracted");
+    let after = cli.json(&["memory", "show", &memory_id]);
+    assert_eq!(after["data"]["memory"]["status"], "retracted");
+    let events = after["data"]["status_events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|e| e["actor"] == "human:test"
+            && e["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("caching is safe")),
+        "the resolution rationale is recorded: {events:?}"
+    );
+
+    // Edit-as-supersede (SDD §5.8): a new version, old record retired.
+    let superseded = cli.json(&[
+        "memory",
+        "supersede",
+        &other_id,
+        "--title",
+        "Do not cache manifest hashes",
+        "--summary",
+        "Caching is safe only after identity covers the config hash.",
+        "--memory-type",
+        "failed_approach",
+        "--scope",
+        "src",
+        "--created-by",
+        "human:other",
+        "--reason",
+        "clarified after the fix",
+    ]);
+    let new_version = superseded["data"]["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        superseded["data"]["supersedes_memory_id"],
+        other_id.as_str()
+    );
+    let old_shown = cli.json(&["memory", "show", &other_id]);
+    assert_eq!(old_shown["data"]["memory"]["status"], "superseded");
+
+    // Retract the new version; history stays queryable.
+    cli.json(&[
+        "memory",
+        "retract",
+        &new_version,
+        "--actor",
+        "human:test",
+        "--reason",
+        "obsolete",
+    ]);
+    let retracted = cli.json(&["memory", "show", &new_version]);
+    assert_eq!(retracted["data"]["memory"]["status"], "retracted");
+
+    // Unknown memory ids are SNAPSHOT_NOT_FOUND.
+    let missing = cli.run(&[
+        "--json",
+        "memory",
+        "show",
+        "00000000-0000-7000-8000-000000000000",
+    ]);
+    assert!(!missing.status.success());
+    assert_eq!(stderr_code(&missing), "SNAPSHOT_NOT_FOUND");
+
+    // Export carries the memory records (FR-036).
+    let export_path = temp.path().join("export.json");
+    let export = cli.json(&["export", "--output", export_path.to_str().unwrap()]);
+    assert!(export["data"]["memories"].as_u64().unwrap() >= 3);
+    let export_text = std::fs::read_to_string(&export_path).unwrap();
+    assert!(export_text.contains("Do not cache manifest hashes"));
+}

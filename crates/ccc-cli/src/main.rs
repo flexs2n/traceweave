@@ -74,6 +74,19 @@ enum Command {
         #[command(subcommand)]
         command: EvidenceCommand,
     },
+    /// Engineering memory (FR-032/033/035): create, list, search, supersede,
+    /// retract, resolve. Memory is subordinate to current source; agent
+    /// findings stay candidates until revalidated or approved.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+    /// List current conflict pairs (both sides + scopes, UI-018 analog).
+    /// Conflicts are never auto-resolved.
+    Conflicts {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Change-impact analysis.
     Impact {
         #[command(subcommand)]
@@ -169,8 +182,129 @@ enum RepoCommand {
 
 #[derive(Debug, Subcommand)]
 enum EvidenceCommand {
+    /// List versioned claims of the evidence ledger, optionally filtered by
+    /// status (candidate, supported, verified, stale, conflicted, ...).
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Show one evidence record with provenance.
     Show { evidence_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// Create a memory record (starts `candidate`; links optional claims).
+    Add {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        summary: String,
+        /// Memory type (e.g. failed_approach, invariant, convention).
+        #[arg(long)]
+        memory_type: String,
+        /// Repository-relative directory scope (empty = repository-wide).
+        #[arg(long, default_value = "")]
+        scope: String,
+        /// Author or producing process (recorded provenance).
+        #[arg(long)]
+        created_by: String,
+        #[arg(long, default_value = "private")]
+        sharing_policy: String,
+        #[arg(long, default_value = "none")]
+        sensitivity: String,
+        /// Supporting claims to link (the memory projects their status).
+        #[arg(long)]
+        claim_id: Vec<String>,
+        /// Idempotency key: identical requests yield one logical job.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// List memory records, optionally filtered by status or type.
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        memory_type: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Show one memory record with claim links and its status history.
+    Show { memory_id: String },
+    /// Full-text search over memory titles and summaries (FR-035).
+    Search {
+        query: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        memory_type: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Edit-as-supersede: create a new version; the old record is retired as
+    /// `superseded` (history immutable, SDD §5.8).
+    Supersede {
+        memory_id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        memory_type: String,
+        #[arg(long, default_value = "")]
+        scope: String,
+        #[arg(long)]
+        created_by: String,
+        #[arg(long, default_value = "private")]
+        sharing_policy: String,
+        #[arg(long, default_value = "none")]
+        sensitivity: String,
+        #[arg(long)]
+        claim_id: Vec<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Retract a memory (logical removal from retrieval; history preserved).
+    Retract {
+        memory_id: String,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Human conflict resolution (SDD §9.4 steps 7–8): the losing memory is
+    /// retracted with the rationale recorded; the kept side returns to
+    /// `candidate`. Conflicts are never resolved automatically.
+    Resolve {
+        #[arg(long)]
+        keep: String,
+        #[arg(long)]
+        drop: String,
+        #[arg(long)]
+        rationale: String,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -325,10 +459,153 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
                     }
                 },
                 Command::Evidence { command } => match command {
+                    EvidenceCommand::List { status, limit } => {
+                        cmd_evidence_list(&store, status.as_deref(), *limit, cli.json).await
+                    }
                     EvidenceCommand::Show { evidence_id } => {
                         cmd_evidence_show(&store, evidence_id, cli.json).await
                     }
                 },
+                Command::Memory { command } => match command {
+                    MemoryCommand::Add {
+                        title,
+                        summary,
+                        memory_type,
+                        scope,
+                        created_by,
+                        sharing_policy,
+                        sensitivity,
+                        claim_id,
+                        idempotency_key,
+                        repo,
+                    } => {
+                        cmd_memory_add(
+                            &store,
+                            repo.as_deref(),
+                            title,
+                            summary,
+                            memory_type,
+                            scope,
+                            created_by,
+                            sharing_policy,
+                            sensitivity,
+                            claim_id,
+                            idempotency_key.as_deref(),
+                            cli.json,
+                        )
+                        .await
+                    }
+                    MemoryCommand::List {
+                        status,
+                        memory_type,
+                        limit,
+                        repo,
+                    } => {
+                        cmd_memory_list(
+                            &store,
+                            repo.as_deref(),
+                            status.as_deref(),
+                            memory_type.as_deref(),
+                            *limit,
+                            cli.json,
+                        )
+                        .await
+                    }
+                    MemoryCommand::Show { memory_id } => {
+                        cmd_memory_show(&store, memory_id, cli.json).await
+                    }
+                    MemoryCommand::Search {
+                        query,
+                        status,
+                        memory_type,
+                        limit,
+                        repo,
+                    } => {
+                        cmd_memory_search(
+                            &store,
+                            repo.as_deref(),
+                            query,
+                            status.as_deref(),
+                            memory_type.as_deref(),
+                            *limit,
+                            cli.json,
+                        )
+                        .await
+                    }
+                    MemoryCommand::Supersede {
+                        memory_id,
+                        title,
+                        summary,
+                        memory_type,
+                        scope,
+                        created_by,
+                        sharing_policy,
+                        sensitivity,
+                        claim_id,
+                        reason,
+                        idempotency_key,
+                        repo,
+                    } => {
+                        cmd_memory_supersede(
+                            &store,
+                            repo.as_deref(),
+                            memory_id,
+                            title,
+                            summary,
+                            memory_type,
+                            scope,
+                            created_by,
+                            sharing_policy,
+                            sensitivity,
+                            claim_id,
+                            reason.as_deref(),
+                            idempotency_key.as_deref(),
+                            cli.json,
+                        )
+                        .await
+                    }
+                    MemoryCommand::Retract {
+                        memory_id,
+                        actor,
+                        reason,
+                        idempotency_key,
+                        repo,
+                    } => {
+                        cmd_memory_retract(
+                            &store,
+                            repo.as_deref(),
+                            memory_id,
+                            actor,
+                            reason.as_deref(),
+                            idempotency_key.as_deref(),
+                            cli.json,
+                        )
+                        .await
+                    }
+                    MemoryCommand::Resolve {
+                        keep,
+                        drop,
+                        rationale,
+                        actor,
+                        idempotency_key,
+                        repo,
+                    } => {
+                        cmd_memory_resolve(
+                            &store,
+                            repo.as_deref(),
+                            keep,
+                            drop,
+                            rationale,
+                            actor,
+                            idempotency_key.as_deref(),
+                            cli.json,
+                        )
+                        .await
+                    }
+                },
+                Command::Conflicts { repo } => {
+                    cmd_conflicts(&store, repo.as_deref(), cli.json).await
+                }
                 Command::Impact { command } => match command {
                     ImpactCommand::Analyze {
                         base,
@@ -700,6 +977,13 @@ async fn cmd_index(
     let result = index_once(store, artifacts, &repo, &cfg, full, snapshot_id).await;
     match result {
         Ok(outcome) => {
+            // Freshness projection (FR-043): memories linked to claims that
+            // the reindex invalidated flip `stale` with a recorded cause;
+            // unrelated memories stay untouched.
+            let memory_freshness =
+                ccc_memory::project_claim_freshness(&**store, &**store, repo.repository_id)
+                    .await
+                    .ok();
             let payload = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());
             let _job = if job.state.is_terminal() {
                 // Idempotent replay: the logical job already completed.
@@ -713,6 +997,10 @@ async fn cmd_index(
                         "snapshot_id": outcome.snapshot_id.to_string(),
                         "generation_id": outcome.generation_id.to_string(),
                         "counters": outcome.counters,
+                        "memories_flipped_stale": memory_freshness
+                            .as_ref()
+                            .map(|s| s.stale_memories.len())
+                            .unwrap_or(0),
                     }),
                     meta_for(
                         &repo,
@@ -731,6 +1019,18 @@ async fn cmd_index(
                     outcome.counters.unsupported,
                     outcome.counters.failed
                 );
+                if let Some(freshness) = &memory_freshness {
+                    if !freshness.stale_memories.is_empty()
+                        || !freshness.conflicted_memories.is_empty()
+                    {
+                        println!(
+                            "Memory freshness: {} stale, {} conflicted (linked claims \
+                             invalidated; see `ccc memory list --status stale`)",
+                            freshness.stale_memories.len(),
+                            freshness.conflicted_memories.len()
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -933,6 +1233,7 @@ async fn cmd_context_compile(
     let compiler = ContextCompiler::new(
         &**store,
         store.as_ref(),
+        store.as_ref(),
         &**store,
         artifacts,
         &search_backend,
@@ -1057,6 +1358,624 @@ async fn cmd_evidence_show(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// evidence list + engineering memory (FR-032/034/035, ui.md UI-016/018)
+// ---------------------------------------------------------------------------
+
+fn parse_claim_status(s: &str) -> Result<ClaimStatus, CccError> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(|_| {
+        CccError::invalid_request(format!(
+            "unknown status {s:?}; known: candidate, supported, verified, stale, conflicted, \
+             superseded, retracted"
+        ))
+    })
+}
+
+fn memory_draft_from(
+    title: &str,
+    summary: &str,
+    memory_type: &str,
+    scope: &str,
+    created_by: &str,
+    sharing_policy: &str,
+    sensitivity: &str,
+) -> Result<ccc_memory::MemoryDraft, CccError> {
+    Ok(ccc_memory::MemoryDraft {
+        title: title.to_string(),
+        summary: summary.to_string(),
+        memory_type: MemoryType::parse(memory_type)?,
+        scope: scope.to_string(),
+        created_by: created_by.to_string(),
+        sharing_policy: sharing_policy.to_string(),
+        sensitivity: sensitivity.to_string(),
+    })
+}
+
+fn parse_claim_ids(raw: &[String]) -> Result<Vec<ClaimId>, CccError> {
+    raw.iter()
+        .map(|s| {
+            ClaimId::from_str(s)
+                .map_err(|_| CccError::invalid_request(format!("invalid claim id {s:?}")))
+        })
+        .collect()
+}
+
+/// Snapshot a memory is authored against: the active generation's snapshot
+/// (memories without an indexed repository cannot be scoped — no false
+/// availability).
+async fn active_snapshot_id(
+    store: &SqliteStore,
+    repo: &RepositoryRecord,
+) -> Result<SnapshotId, CccError> {
+    let generation = store
+        .get_active_generation(repo.repository_id)
+        .await?
+        .ok_or_else(|| {
+            CccError::snapshot_not_found("no published index generation; run `ccc index` first")
+        })?;
+    Ok(generation.snapshot_id)
+}
+
+async fn cmd_evidence_list(
+    store: &SqliteStore,
+    status: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<(), CccError> {
+    let status_filter = status.map(parse_claim_status).transpose()?;
+    let repos = store.list_repositories().await?;
+    let mut claims = Vec::new();
+    for repo in &repos {
+        for claim in store.list_claims(repo.repository_id).await? {
+            if let Some(want) = status_filter {
+                if claim.status != want {
+                    continue;
+                }
+            }
+            claims.push(claim);
+        }
+    }
+    claims.truncate(limit);
+    if json {
+        print_json(&envelope(&claims, EnvelopeMeta::default())?)?;
+    } else {
+        if claims.is_empty() {
+            println!("No claims recorded.");
+        }
+        for c in &claims {
+            println!(
+                "{} [{}] ({}) {} — {}",
+                c.claim_id,
+                serde_json::to_string(&c.status)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                c.claim_type,
+                c.text,
+                c.snapshot_id
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_memory_add(
+    store: &Arc<SqliteStore>,
+    repo_path: Option<&std::path::Path>,
+    title: &str,
+    summary: &str,
+    memory_type: &str,
+    scope: &str,
+    created_by: &str,
+    sharing_policy: &str,
+    sensitivity: &str,
+    claim_ids: &[String],
+    idempotency_key: Option<&str>,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let snapshot_id = active_snapshot_id(store, &repo).await?;
+    let claim_ids = parse_claim_ids(claim_ids)?;
+    let draft = memory_draft_from(
+        title,
+        summary,
+        memory_type,
+        scope,
+        created_by,
+        sharing_policy,
+        sensitivity,
+    )?;
+    let mut key_parts: Vec<String> = vec![
+        "memory_add".into(),
+        repo.repository_id.to_string(),
+        draft.title.clone(),
+        draft.summary.clone(),
+        draft.memory_type.as_str().into(),
+        draft.scope.clone(),
+        draft.created_by.clone(),
+        claim_ids
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    ];
+    key_parts.sort();
+    let key = idempotency_key.map(str::to_string).unwrap_or_else(|| {
+        jobs::idempotency_key(&key_parts.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    let job = jobs::begin_job(&**store, repo.repository_id, "memory_add", &key, None).await?;
+
+    match ccc_memory::create_memory_with_detection(
+        store.as_ref(),
+        store.as_ref(),
+        repo.repository_id,
+        snapshot_id,
+        &claim_ids,
+        draft,
+    )
+    .await
+    {
+        Ok(mutation) => {
+            let _job = if job.state.is_terminal() {
+                job
+            } else {
+                jobs::finish_success(&**store, job, Some(&mutation.record.memory_id.to_string()))
+                    .await?
+            };
+            emit_memory_mutation(&mutation, &repo, Some(snapshot_id), json)?;
+            Ok(())
+        }
+        Err(e) => {
+            jobs::finish_failure(&**store, job, &e).await?;
+            Err(e)
+        }
+    }
+}
+
+/// Emits a memory mutation; the detected-conflict count is part of the
+/// output — new disagreements surface immediately, never silently (FR-034).
+fn emit_memory_mutation(
+    mutation: &ccc_memory::MemoryMutation,
+    repo: &RepositoryRecord,
+    snapshot_id: Option<SnapshotId>,
+    json: bool,
+) -> Result<(), CccError> {
+    let detected = mutation.conflicts.conflicted.len();
+    if json {
+        let value = serde_json::to_value(&mutation.record)
+            .map_err(|e| CccError::internal_error(format!("serialize memory: {e}")))?;
+        let mut object = match value {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        object.insert("detected_conflicts".into(), serde_json::json!(detected));
+        print_json(&envelope(
+            &serde_json::Value::Object(object),
+            meta_for(repo, snapshot_id, None),
+        )?)?;
+    } else {
+        emit_memory(&mutation.record, repo, snapshot_id, false)?;
+        if detected > 0 {
+            println!(
+                "Detected {detected} conflict pair(s) — inspect with `ccc conflicts`; \
+                 conflicts are never auto-resolved."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn emit_memory(
+    record: &MemoryRecord,
+    repo: &RepositoryRecord,
+    snapshot_id: Option<SnapshotId>,
+    json: bool,
+) -> Result<(), CccError> {
+    if json {
+        print_json(&envelope(record, meta_for(repo, snapshot_id, None))?)?;
+    } else {
+        println!("Memory {}", record.memory_id);
+        println!("  title: {}", record.title);
+        println!("  type: {}", record.memory_type.as_str());
+        println!(
+            "  status: {}",
+            serde_json::to_string(&record.status)
+                .unwrap_or_default()
+                .trim_matches('"')
+        );
+        println!(
+            "  scope: {}",
+            if record.scope.is_empty() {
+                "(repository-wide)"
+            } else {
+                &record.scope
+            }
+        );
+        println!("  created_by: {}", record.created_by);
+        println!("  summary: {}", record.summary);
+    }
+    Ok(())
+}
+
+async fn cmd_memory_list(
+    store: &SqliteStore,
+    repo_path: Option<&std::path::Path>,
+    status: Option<&str>,
+    memory_type: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let status_filter = status.map(parse_claim_status).transpose()?;
+    let type_filter = memory_type.map(MemoryType::parse).transpose()?;
+    let mut records = match status_filter {
+        Some(s) => {
+            store
+                .list_memories_by_status(repo.repository_id, &[s])
+                .await?
+        }
+        None => store.list_memories(repo.repository_id).await?,
+    };
+    if let Some(t) = type_filter {
+        records.retain(|m| m.memory_type == t);
+    }
+    records.truncate(limit);
+    if json {
+        print_json(&envelope(&records, meta_for(&repo, None, None))?)?;
+    } else {
+        if records.is_empty() {
+            println!("No memory records.");
+        }
+        for m in &records {
+            println!(
+                "{} [{}] {} ({}) — {}",
+                m.memory_id,
+                serde_json::to_string(&m.status)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                m.title,
+                m.memory_type.as_str(),
+                m.summary
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_memory_show(store: &SqliteStore, memory_id: &str, json: bool) -> Result<(), CccError> {
+    let id = MemoryId::from_str(memory_id)
+        .map_err(|_| CccError::invalid_request(format!("invalid memory id {memory_id:?}")))?;
+    let record = store
+        .get_memory(id)
+        .await?
+        .ok_or_else(|| CccError::snapshot_not_found(format!("memory {memory_id} not found")))?;
+    let claim_ids = store.claim_ids_for_memory(id).await?;
+    let events = store.list_memory_status_events(id).await?;
+    // last_accessed_at records retrieval (SDD §5.11).
+    store.touch_memory(id, &now_rfc3339()).await?;
+    if json {
+        print_json(&envelope(
+            &serde_json::json!({
+                "memory": record,
+                "claim_ids": claim_ids.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                "status_events": events,
+            }),
+            EnvelopeMeta::default(),
+        )?)?;
+    } else {
+        println!("Memory {}", record.memory_id);
+        println!("  title: {}", record.title);
+        println!(
+            "  status: {}",
+            serde_json::to_string(&record.status)
+                .unwrap_or_default()
+                .trim_matches('"')
+        );
+        if let Some(cause) = &record.stale_cause {
+            println!("  cause: {cause}");
+        }
+        println!("  type: {}", record.memory_type.as_str());
+        println!(
+            "  scope: {}",
+            if record.scope.is_empty() {
+                "(repository-wide)"
+            } else {
+                &record.scope
+            }
+        );
+        println!(
+            "  created_by: {} at {}",
+            record.created_by, record.created_at
+        );
+        println!("  last_accessed_at: {}", record.last_accessed_at);
+        println!("  summary: {}", record.summary);
+        if let Some(superseded_id) = record.supersedes_memory_id {
+            println!("  supersedes: {superseded_id}");
+        }
+        println!(
+            "  claims: {}",
+            if claim_ids.is_empty() {
+                "(none — unverified note)"
+            } else {
+                ""
+            }
+        );
+        for c in &claim_ids {
+            println!("    - {c}");
+        }
+        for e in &events {
+            println!(
+                "  event: {} → {} by {}{}",
+                e.created_at,
+                serde_json::to_string(&e.status)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                e.actor,
+                e.reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_memory_search(
+    store: &SqliteStore,
+    repo_path: Option<&std::path::Path>,
+    query: &str,
+    status: Option<&str>,
+    memory_type: Option<&str>,
+    limit: u32,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let status_filter = status.map(parse_claim_status).transpose()?;
+    let type_filter = memory_type.map(MemoryType::parse).transpose()?;
+    let records = store
+        .search_memories(repo.repository_id, query, status_filter, type_filter, limit)
+        .await?;
+    let now = now_rfc3339();
+    for m in &records {
+        store.touch_memory(m.memory_id, &now).await?;
+    }
+    if json {
+        print_json(&envelope(&records, meta_for(&repo, None, None))?)?;
+    } else {
+        if records.is_empty() {
+            println!("No memory hits for {query:?}.");
+        }
+        for m in &records {
+            println!(
+                "{} [{}] {} — {}",
+                m.memory_id,
+                serde_json::to_string(&m.status)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                m.title,
+                m.summary
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_memory_supersede(
+    store: &Arc<SqliteStore>,
+    repo_path: Option<&std::path::Path>,
+    memory_id: &str,
+    title: &str,
+    summary: &str,
+    memory_type: &str,
+    scope: &str,
+    created_by: &str,
+    sharing_policy: &str,
+    sensitivity: &str,
+    claim_ids: &[String],
+    reason: Option<&str>,
+    idempotency_key: Option<&str>,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let snapshot_id = active_snapshot_id(store, &repo).await?;
+    let old_id = MemoryId::from_str(memory_id)
+        .map_err(|_| CccError::invalid_request(format!("invalid memory id {memory_id:?}")))?;
+    let claim_ids = parse_claim_ids(claim_ids)?;
+    let draft = memory_draft_from(
+        title,
+        summary,
+        memory_type,
+        scope,
+        created_by,
+        sharing_policy,
+        sensitivity,
+    )?;
+    let key = idempotency_key.map(str::to_string).unwrap_or_else(|| {
+        jobs::idempotency_key(&[
+            "memory_supersede",
+            &repo.repository_id.to_string(),
+            &old_id.to_string(),
+            &draft.title,
+            &draft.summary,
+            draft.memory_type.as_str(),
+            &draft.scope,
+            &draft.created_by,
+            reason.unwrap_or(""),
+        ])
+    });
+    let job = jobs::begin_job(&**store, repo.repository_id, "memory_supersede", &key, None).await?;
+
+    match ccc_memory::supersede_memory(
+        store.as_ref(),
+        store.as_ref(),
+        repo.repository_id,
+        snapshot_id,
+        old_id,
+        &claim_ids,
+        ccc_memory::MemoryEdit {
+            draft,
+            reason: reason.map(str::to_string),
+        },
+    )
+    .await
+    {
+        Ok(mutation) => {
+            let _job = if job.state.is_terminal() {
+                job
+            } else {
+                jobs::finish_success(&**store, job, Some(&mutation.record.memory_id.to_string()))
+                    .await?
+            };
+            emit_memory_mutation(&mutation, &repo, Some(snapshot_id), json)?;
+            Ok(())
+        }
+        Err(e) => {
+            jobs::finish_failure(&**store, job, &e).await?;
+            Err(e)
+        }
+    }
+}
+
+async fn cmd_memory_retract(
+    store: &Arc<SqliteStore>,
+    repo_path: Option<&std::path::Path>,
+    memory_id: &str,
+    actor: &str,
+    reason: Option<&str>,
+    idempotency_key: Option<&str>,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let id = MemoryId::from_str(memory_id)
+        .map_err(|_| CccError::invalid_request(format!("invalid memory id {memory_id:?}")))?;
+    let key = idempotency_key.map(str::to_string).unwrap_or_else(|| {
+        jobs::idempotency_key(&[
+            "memory_retract",
+            &repo.repository_id.to_string(),
+            &id.to_string(),
+            actor,
+            reason.unwrap_or(""),
+        ])
+    });
+    let job = jobs::begin_job(&**store, repo.repository_id, "memory_retract", &key, None).await?;
+
+    match ccc_memory::retract_memory(store.as_ref(), id, actor, reason).await {
+        Ok(record) => {
+            let _job = if job.state.is_terminal() {
+                job
+            } else {
+                jobs::finish_success(&**store, job, Some(&record.memory_id.to_string())).await?
+            };
+            emit_memory(&record, &repo, None, json)?;
+            Ok(())
+        }
+        Err(e) => {
+            jobs::finish_failure(&**store, job, &e).await?;
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_memory_resolve(
+    store: &Arc<SqliteStore>,
+    repo_path: Option<&std::path::Path>,
+    keep: &str,
+    drop: &str,
+    rationale: &str,
+    actor: &str,
+    idempotency_key: Option<&str>,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let keep_id = MemoryId::from_str(keep)
+        .map_err(|_| CccError::invalid_request(format!("invalid memory id {keep:?}")))?;
+    let drop_id = MemoryId::from_str(drop)
+        .map_err(|_| CccError::invalid_request(format!("invalid memory id {drop:?}")))?;
+    let key = idempotency_key.map(str::to_string).unwrap_or_else(|| {
+        jobs::idempotency_key(&[
+            "memory_resolve",
+            &repo.repository_id.to_string(),
+            &keep_id.to_string(),
+            &drop_id.to_string(),
+            rationale,
+            actor,
+        ])
+    });
+    let job = jobs::begin_job(&**store, repo.repository_id, "memory_resolve", &key, None).await?;
+
+    match ccc_memory::resolve_conflict(
+        store.as_ref(),
+        repo.repository_id,
+        keep_id,
+        drop_id,
+        rationale,
+        actor,
+    )
+    .await
+    {
+        Ok(resolution) => {
+            let _job = if job.state.is_terminal() {
+                job
+            } else {
+                jobs::finish_success(
+                    &**store,
+                    job,
+                    Some(&resolution.dropped.memory_id.to_string()),
+                )
+                .await?
+            };
+            if json {
+                print_json(&envelope(&resolution, meta_for(&repo, None, None))?)?;
+            } else {
+                println!(
+                    "Resolution recorded: {} retracted; {} kept (returns to candidate).",
+                    resolution.dropped.memory_id, resolution.kept.memory_id
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            jobs::finish_failure(&**store, job, &e).await?;
+            Err(e)
+        }
+    }
+}
+
+async fn cmd_conflicts(
+    store: &SqliteStore,
+    repo_path: Option<&std::path::Path>,
+    json: bool,
+) -> Result<(), CccError> {
+    let repo = resolve_repo(store, repo_path).await?;
+    let pairs = ccc_memory::list_conflicts(store, store, repo.repository_id).await?;
+    if json {
+        print_json(&envelope(&pairs, meta_for(&repo, None, None))?)?;
+    } else {
+        if pairs.is_empty() {
+            println!("No conflicted evidence.");
+        }
+        for p in &pairs {
+            println!(
+                "{} {} — scope: {} (snapshots {})",
+                p.kind,
+                p.label,
+                p.shared_scope,
+                if p.snapshot_match { "match" } else { "differ" }
+            );
+            println!("  left  {} [{}]: {}", p.left_id, p.left_title, p.left_text);
+            println!(
+                "  right {} [{}]: {}",
+                p.right_id, p.right_title, p.right_text
+            );
+            println!("  resolution: `ccc memory resolve --keep <id> --drop <id> --rationale … --actor …`");
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_impact_analyze(
     store: &Arc<SqliteStore>,
     _artifacts: &FsArtifactStore,
@@ -1112,6 +2031,15 @@ async fn cmd_export(
     let repositories = vec![repo.clone()];
     let claims = store.list_claims(repo.repository_id).await?;
     let evidence = store.list_evidence(repo.repository_id).await?;
+    let memories = store.list_memories(repo.repository_id).await?;
+    let mut memory_docs = Vec::new();
+    for m in &memories {
+        memory_docs.push(serde_json::json!({
+            "memory": m,
+            "claim_ids": store.claim_ids_for_memory(m.memory_id).await?,
+            "status_events": store.list_memory_status_events(m.memory_id).await?,
+        }));
+    }
     let bundles = store.list_bundles(repo.repository_id).await?;
     let mut bundle_docs = Vec::new();
     for b in &bundles {
@@ -1126,6 +2054,7 @@ async fn cmd_export(
         "repositories": repositories,
         "claims": claims,
         "evidence": evidence,
+        "memories": memory_docs,
         "bundles": bundle_docs,
     });
     let text = serde_json::to_string_pretty(&export)
@@ -1138,15 +2067,17 @@ async fn cmd_export(
                 "output": output.to_string_lossy(),
                 "claims": claims.len(),
                 "evidence": evidence.len(),
+                "memories": memories.len(),
                 "bundles": bundles.len(),
             }),
             meta_for(&repo, None, None),
         )?)?;
     } else {
         println!(
-            "Exported {} claim(s), {} evidence record(s), {} bundle(s) to {}",
+            "Exported {} claim(s), {} evidence record(s), {} memory record(s), {} bundle(s) to {}",
             claims.len(),
             evidence.len(),
+            memories.len(),
             bundles.len(),
             output.display()
         );
@@ -1193,6 +2124,7 @@ async fn cmd_verify(
     let job = jobs::begin_job(&**store, repo.repository_id, "verify", &key, None).await?;
 
     let engine = ccc_verification::VerificationEngine::new(
+        &**store,
         &**store,
         &**store,
         &**store,
@@ -1393,8 +2325,9 @@ async fn cmd_eval_run(
     let job = jobs::begin_job(&**store, repo.repository_id, "eval_run", &key, None).await?;
 
     let search = FtsSearchBackend::new(&**store, &**store, &**store);
-    let runner =
-        ccc_evaluation::EvalRunner::new(&**store, &**store, &**store, artifacts, &search, &**store);
+    let runner = ccc_evaluation::EvalRunner::new(
+        &**store, &**store, &**store, &**store, artifacts, &search, &**store,
+    );
     match runner
         .run_suite(&repo, &suite, &config_hash, weights_override.as_ref())
         .await

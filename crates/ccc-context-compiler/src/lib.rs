@@ -795,12 +795,6 @@ fn select_within_budget(
     candidates: &[Candidate],
     budget_tokens: u64,
 ) -> (Vec<Candidate>, Vec<BundleOmission>, String) {
-    let mut selected: Vec<Candidate> = Vec::new();
-    let mut selected_files: HashSet<String> = HashSet::new();
-    let mut remaining_budget = budget_tokens;
-    let mut omissions: Vec<BundleOmission> = Vec::new();
-    let mut any_budget_omission = false;
-
     let max_score = candidates
         .iter()
         .map(|c| c.score)
@@ -817,48 +811,76 @@ fn select_within_budget(
         ((c.score - dup) / (c.token_cost.max(1) as f64) * 1000.0) as i64
     };
 
-    let mut remaining: Vec<usize> = (0..candidates.len()).collect();
-    while !remaining.is_empty() {
-        // Pick the best remaining candidate by marginal utility, ties by id.
-        remaining.sort_by(|&i, &j| {
-            let ui = utility(&candidates[i], &selected_files);
-            let uj = utility(&candidates[j], &selected_files);
-            uj.cmp(&ui)
-                .then(candidates[i].entity_id.cmp(&candidates[j].entity_id))
-        });
-        let best = *remaining.last().unwrap();
-        remaining.pop();
-        let c = &candidates[best];
-        if c.token_cost <= remaining_budget {
-            remaining_budget -= c.token_cost;
-            selected_files.insert(c.path.clone());
-            selected.push(c.clone());
-        } else if c.score >= high_threshold {
-            omissions.push(BundleOmission {
-                entity_id: c.entity_id.clone(),
-                path: c.path.clone(),
-                title: c.title.clone(),
-                score_millis: c.score_millis,
-                reason: "budget_exceeded".into(),
+    // The documented pre-order (tier → score desc → token asc → entity id)
+    // bounds the selection sweep: channel tiers are processed in order and
+    // marginal utility decides *within* a tier (dogfood finding D-4 — the
+    // utility-only sweep let cheap dependency items crowd out exact seeds).
+    let mut ordered: Vec<Candidate> = candidates.to_vec();
+    ordered.sort_by(|a, b| {
+        a.channel
+            .tier()
+            .cmp(&b.channel.tier())
+            .then(b.score_millis.cmp(&a.score_millis))
+            .then(a.token_cost.cmp(&b.token_cost))
+            .then(a.entity_id.cmp(&b.entity_id))
+    });
+
+    let mut selected: Vec<Candidate> = Vec::new();
+    let mut selected_files: HashSet<String> = HashSet::new();
+    let mut remaining_budget = budget_tokens;
+    let mut omissions: Vec<BundleOmission> = Vec::new();
+    let mut any_budget_omission = false;
+
+    let mut start = 0usize;
+    while start < ordered.len() {
+        let tier = ordered[start].channel.tier();
+        let end = start
+            + ordered[start..]
+                .iter()
+                .take_while(|c| c.channel.tier() == tier)
+                .count();
+        let mut tier_indices: Vec<usize> = (start..end).collect();
+        while !tier_indices.is_empty() {
+            tier_indices.sort_by(|&i, &j| {
+                let ui = utility(&ordered[i], &selected_files);
+                let uj = utility(&ordered[j], &selected_files);
+                uj.cmp(&ui)
+                    .then(ordered[i].entity_id.cmp(&ordered[j].entity_id))
             });
-            any_budget_omission = true;
-        } else if selected_files.contains(&c.path) {
-            omissions.push(BundleOmission {
-                entity_id: c.entity_id.clone(),
-                path: c.path.clone(),
-                title: c.title.clone(),
-                score_millis: c.score_millis,
-                reason: "duplicate".into(),
-            });
-        } else {
-            omissions.push(BundleOmission {
-                entity_id: c.entity_id.clone(),
-                path: c.path.clone(),
-                title: c.title.clone(),
-                score_millis: c.score_millis,
-                reason: "lower_relevance".into(),
-            });
+            let best = tier_indices.remove(0);
+            let c = &ordered[best];
+            if c.token_cost <= remaining_budget {
+                remaining_budget -= c.token_cost;
+                selected_files.insert(c.path.clone());
+                selected.push(c.clone());
+            } else if c.score >= high_threshold {
+                omissions.push(BundleOmission {
+                    entity_id: c.entity_id.clone(),
+                    path: c.path.clone(),
+                    title: c.title.clone(),
+                    score_millis: c.score_millis,
+                    reason: "budget_exceeded".into(),
+                });
+                any_budget_omission = true;
+            } else if selected_files.contains(&c.path) {
+                omissions.push(BundleOmission {
+                    entity_id: c.entity_id.clone(),
+                    path: c.path.clone(),
+                    title: c.title.clone(),
+                    score_millis: c.score_millis,
+                    reason: "duplicate".into(),
+                });
+            } else {
+                omissions.push(BundleOmission {
+                    entity_id: c.entity_id.clone(),
+                    path: c.path.clone(),
+                    title: c.title.clone(),
+                    score_millis: c.score_millis,
+                    reason: "lower_relevance".into(),
+                });
+            }
         }
+        start = end;
     }
     let stopping_reason = if selected.is_empty() && candidates.is_empty() {
         "no_candidates".to_string()

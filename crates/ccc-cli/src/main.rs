@@ -701,7 +701,12 @@ async fn cmd_index(
     match result {
         Ok(outcome) => {
             let payload = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());
-            jobs::finish_success(&**store, job, Some(&payload)).await?;
+            let _job = if job.state.is_terminal() {
+                // Idempotent replay: the logical job already completed.
+                job
+            } else {
+                jobs::finish_success(&**store, job, Some(&payload)).await?
+            };
             if json {
                 print_json(&envelope(
                     &serde_json::json!({

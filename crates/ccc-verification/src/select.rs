@@ -51,7 +51,8 @@ pub async fn select_checks(
         for symbol_id in &frontier {
             for edge in index.list_edges_incoming(snapshot_id, *symbol_id).await? {
                 if edge.edge_type == RelationshipType::Tests {
-                    // The source is a synthetic test module (FR-016).
+                    // The source is a synthetic test module (FR-016); only
+                    // edges mapping to a real cargo target are suggested.
                     if let Some(name) = test_target_name(&edge) {
                         if changed_symbol_ids.contains(symbol_id) {
                             direct_tests.insert(name.clone(), name);
@@ -109,17 +110,20 @@ pub async fn select_checks(
 }
 
 /// Derives the cargo integration-test target name from a `tests` edge's
-/// synthetic test-module symbol context (`tests::smoke` → `smoke`). Falls
-/// back to the provenance path (`tests/smoke.rs` → `smoke`).
+/// provenance path. Only real cargo targets are suggested (a nested path
+/// without a `main.rs` is NOT a target — dogfood finding D-1):
+/// - `tests/smoke.rs` → `smoke`
+/// - `tests/it/main.rs` → `it`
+/// - `tests/fixtures/rust-sample/lib.rs` → none (not a target)
 fn test_target_name(edge: &EdgeRecord) -> Option<String> {
-    if let Some(path) = &edge.provenance_ref {
-        let stem = path
-            .strip_prefix("tests/")
-            .unwrap_or(path)
-            .trim_end_matches(".rs");
-        // Nested targets (tests/it/main.rs) map to their first path component
-        // as a cargo test target; the flat common case maps 1:1.
-        let name = stem.split('/').next().unwrap_or(stem);
+    let path = edge.provenance_ref.as_ref()?;
+    let rest = path.strip_prefix("tests/")?;
+    let stem = rest.strip_suffix(".rs")?;
+    if !stem.contains('/') {
+        return Some(stem.to_string());
+    }
+    if let Some(dir) = stem.strip_suffix("/main") {
+        let name = dir.split('/').next().unwrap_or(dir);
         if !name.is_empty() {
             return Some(name.to_string());
         }

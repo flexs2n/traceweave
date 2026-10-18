@@ -6,6 +6,32 @@ use ccc_jobs as jobs;
 use ccc_repository::{GitCli, GitProvider};
 use std::path::PathBuf;
 
+/// The verify idempotency key: same repository + patch + policy replays one
+/// logical job. Single source for the synchronous op and the async submit
+/// path (T4).
+pub fn verify_job_key(
+    data_dir: &std::path::Path,
+    repo: &ccc_domain::RepositoryRecord,
+    base: &str,
+    head: Option<&str>,
+    policy_name: &str,
+) -> Result<String, CccError> {
+    let policy = ccc_verification::load_policy(data_dir, policy_name)?;
+    let root = PathBuf::from(&repo.root_path);
+    let head_commit = GitCli.rev_parse_head(&root)?.unwrap_or_default();
+    let dirty = !GitCli.status_porcelain(&root)?.is_empty();
+    Ok(jobs::idempotency_key(&[
+        "verify",
+        &repo.repository_id.to_string(),
+        base,
+        head.unwrap_or("working_tree"),
+        policy_name,
+        &policy.hash(),
+        &head_commit,
+        &format!("{dirty}"),
+    ]))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn verify(
     ctx: &AppContext,
@@ -17,11 +43,12 @@ pub async fn verify(
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let repo = resolve_repo(store, repo_path).await?;
-    verify_record(ctx, &repo, base, head, policy_name, format).await
+    verify_record(ctx, &repo, base, head, policy_name, format, None).await
 }
 
 /// The verify operation against an already-resolved repository record (the
-/// T4 job runner resolves once, then executes).
+/// T4 job runner resolves once, then executes). `external_key` (an
+/// `Idempotency-Key` header) replaces the derived key when present.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_record(
     ctx: &AppContext,
@@ -30,6 +57,7 @@ pub async fn verify_record(
     head: Option<&str>,
     policy_name: &str,
     format: &str,
+    external_key: Option<&str>,
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let artifacts = &*ctx.artifacts;
@@ -39,20 +67,10 @@ pub async fn verify_record(
     // Policies come only from the data dir; an unknown name is INVALID_REQUEST
     // (no silent fallback, no false availability).
     let policy = ccc_verification::load_policy(data_dir, policy_name)?;
-
-    // Idempotency: same repository + patch + policy replays one logical job.
-    let head_commit = GitCli.rev_parse_head(&root)?.unwrap_or_default();
-    let dirty = !GitCli.status_porcelain(&root)?.is_empty();
-    let key = jobs::idempotency_key(&[
-        "verify",
-        &repo.repository_id.to_string(),
-        base,
-        head.unwrap_or("working_tree"),
-        policy_name,
-        &policy.hash(),
-        &head_commit,
-        &format!("{dirty}"),
-    ]);
+    let key = match external_key {
+        Some(k) => k.to_string(),
+        None => verify_job_key(data_dir, repo, base, head, policy_name)?,
+    };
     let job = jobs::begin_job(&**store, repo.repository_id, "verify", &key, None).await?;
 
     let engine = ccc_verification::VerificationEngine::new(

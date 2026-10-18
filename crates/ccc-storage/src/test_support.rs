@@ -951,6 +951,12 @@ impl JobStore for InMemoryJobStore {
             .cloned()
             .collect())
     }
+    async fn set_job_payload(&self, id: JobId, payload_json: &str) -> StoreResult<()> {
+        if let Some(job) = self.0.lock().unwrap().iter_mut().find(|j| j.job_id == id) {
+            job.payload_json = Some(payload_json.to_string());
+        }
+        Ok(())
+    }
 }
 
 /// In-memory [`BundleStore`].

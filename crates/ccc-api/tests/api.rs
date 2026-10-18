@@ -9,7 +9,6 @@ use ccc_service::AppContext;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tower::ServiceExt;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -64,6 +63,7 @@ async fn setup_ctx(temp: &Path) -> (AppContext, PathBuf, String) {
             .unwrap(),
         false,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -71,14 +71,30 @@ async fn setup_ctx(temp: &Path) -> (AppContext, PathBuf, String) {
 }
 
 fn state(ctx: &AppContext, token: Option<&str>) -> AppState {
-    AppState {
-        ctx: Arc::new(AppContext {
-            data_dir: ctx.data_dir.clone(),
-            store: ctx.store.clone(),
-            artifacts: ctx.artifacts.clone(),
-        }),
-        token: token.map(str::to_string),
+    let ctx = AppContext {
+        data_dir: ctx.data_dir.clone(),
+        store: ctx.store.clone(),
+        artifacts: ctx.artifacts.clone(),
+    };
+    AppState::new(ctx, token.map(str::to_string))
+}
+
+/// Polls `GET /v1/jobs/{id}` until a terminal state (TIS §15.1).
+async fn wait_terminal(app: &axum::Router, job_id: &str) -> Value {
+    for _ in 0..300 {
+        let (status, body) = send(
+            app,
+            request("GET", &format!("/v1/jobs/{job_id}"), None, None),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let state = body["data"]["state"].as_str().unwrap_or("");
+        if matches!(state, "succeeded" | "failed" | "cancelled") {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    panic!("job {job_id} never reached a terminal state");
 }
 
 fn request(
@@ -218,7 +234,7 @@ async fn index_snapshots_search_compile_flow() {
     let (ctx, _repo, repo_id) = setup_ctx(temp.path()).await;
     let app = router(state(&ctx, None));
 
-    // POST index → 200 envelope with snapshot/generation identity.
+    // POST index → 202 + Location; the job polls to succeeded.
     let (status, body) = send(
         &app,
         request(
@@ -229,9 +245,35 @@ async fn index_snapshots_search_compile_flow() {
         ),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::OK);
-    assert!(body["data"]["snapshot_id"].is_string());
-    assert!(body["data"]["generation_id"].is_string());
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job_id = body["data"]["job_id"].as_str().unwrap().to_string();
+    // The setup already indexed this exact tree, so this submit may replay
+    // the setup's terminal job outright (TIS §13.3) — polling stays correct.
+    let job = wait_terminal(&app, &job_id).await;
+    assert_eq!(job["data"]["state"], "succeeded");
+    assert!(
+        job["data"]["payload_json"].is_string(),
+        "the index job payload persists the outcome: {job}"
+    );
+
+    // Re-submit against the same tree: the derived key replays the same
+    // logical job (TIS §13.3).
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/v1/repositories/{repo_id}/index"),
+            Some(json!({})),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    assert_eq!(
+        body["data"]["job_id"].as_str().unwrap(),
+        job_id.as_str(),
+        "same tree → one logical job"
+    );
 
     // Snapshots list.
     let (status, body) = send(
@@ -327,7 +369,8 @@ async fn impact_verify_and_eval_flow() {
         .is_empty());
     assert!(body["data"]["known_blind_spots"].as_array().unwrap().len() >= 3);
 
-    // Verification: analysis mode executes nothing (honest statuses).
+    // Verification: job accepted, polls terminal; the job payload carries
+    // the report identity (the report itself renders via CLI/markdown).
     let (status, body) = send(
         &app,
         request(
@@ -338,10 +381,14 @@ async fn impact_verify_and_eval_flow() {
         ),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::OK);
-    assert_eq!(body["data"]["mode"], "analysis");
-    let checks = body["data"]["checks"].as_array().unwrap();
-    assert!(checks.iter().all(|c| c["status"] == "not_run"));
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let verify_job_id = body["data"]["job_id"].as_str().unwrap().to_string();
+    let job = wait_terminal(&app, &verify_job_id).await;
+    assert_eq!(job["data"]["state"], "succeeded");
+    assert!(
+        job["data"]["payload_json"].is_string(),
+        "the verify job payload carries the report identity: {job}"
+    );
 
     // Unknown policy → 400 INVALID_REQUEST.
     let (status, body) = send(
@@ -357,7 +404,8 @@ async fn impact_verify_and_eval_flow() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "INVALID_REQUEST");
 
-    // Eval run via direct suite path; the recorded run is then retrievable.
+    // Eval run: job accepted, polls terminal; the recorded run id comes
+    // from the job payload; the run is then retrievable with metrics.
     let suite_path = std::fs::canonicalize(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/suites/fixture.toml"),
     )
@@ -372,14 +420,15 @@ async fn impact_verify_and_eval_flow() {
         ),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::OK);
-    let run_id = body["data"]["run_id"].as_str().unwrap().to_string();
-    assert!(
-        body["data"]["metrics"]["tuning"]["recall_millis"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let eval_job_id = body["data"]["job_id"].as_str().unwrap().to_string();
+    let job = wait_terminal(&app, &eval_job_id).await;
+    assert_eq!(job["data"]["state"], "succeeded");
+    let run_id = job["data"]["payload_json"]
+        .as_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
 
     let (status, body) = send(
         &app,
@@ -390,6 +439,12 @@ async fn impact_verify_and_eval_flow() {
     assert_eq!(
         body["data"]["metrics"]["retrieval_policy_version"],
         "policy-v1"
+    );
+    assert!(
+        body["data"]["metrics"]["tuning"]["recall_millis"]
+            .as_u64()
+            .unwrap()
+            > 0
     );
     let (status, _body) = send(
         &app,
@@ -485,4 +540,129 @@ async fn serve_binds_loopback_and_answers_health_over_tcp() {
 
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn idempotency_header_replays_one_logical_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, _repo, repo_id) = setup_ctx(temp.path()).await;
+    let app = router(state(&ctx, None));
+
+    // Two submissions carrying the same Idempotency-Key header (the header
+    // replaces the derived key, TIS §13.3): one logical job.
+    let submit = |app: &axum::Router| {
+        let mut r = request(
+            "POST",
+            &format!("/v1/repositories/{repo_id}/index"),
+            Some(json!({})),
+            None,
+        );
+        r.headers_mut().insert(
+            "idempotency-key",
+            axum::http::HeaderValue::from_static("flow-key-1"),
+        );
+        app.clone().oneshot(r)
+    };
+
+    let first = submit(&app).await.unwrap();
+    assert_eq!(first.status(), axum::http::StatusCode::ACCEPTED);
+    let location = first.headers()["location"].to_str().unwrap().to_string();
+    let bytes = first.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let job_id = body["data"]["job_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        location,
+        format!("/v1/jobs/{job_id}"),
+        "202 carries the poll Location (TIS §13.1)"
+    );
+    wait_terminal(&app, &job_id).await;
+
+    let second = submit(&app).await.unwrap();
+    let bytes = second.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["data"]["job_id"].as_str().unwrap(),
+        job_id.as_str(),
+        "same header key replays one logical job"
+    );
+}
+
+#[tokio::test]
+async fn failed_jobs_report_the_error_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, _repo, repo_id) = setup_ctx(temp.path()).await;
+    let app = router(state(&ctx, None));
+
+    // A bogus snapshot id fails the index job; the ledger records why.
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/v1/repositories/{repo_id}/index"),
+            Some(json!({"snapshot": "nope-not-a-uuid"})),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let job_id = body["data"]["job_id"].as_str().unwrap().to_string();
+    let job = wait_terminal(&app, &job_id).await;
+    assert_eq!(job["data"]["state"], "failed");
+    assert_eq!(job["data"]["error_code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn heavy_jobs_share_two_slots_and_all_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, repo_dir, repo_id) = setup_ctx(temp.path()).await;
+    let app = router(state(&ctx, None));
+
+    // A committed change so the verify job has a real range.
+    std::fs::write(
+        repo_dir.join("src/util.rs"),
+        "/// Reads the application configuration.\npub fn read_config() -> u8 {\n    42\n}\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "-A"]);
+    git(&repo_dir, &["commit", "-m", "change util"]);
+
+    // Four distinct heavy jobs race through the two slots (T4 bound: ≤2
+    // concurrent heavy jobs; if the semaphore starved them, the polls below
+    // would time out).
+    let suite_path = std::fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/suites/fixture.toml"),
+    )
+    .unwrap();
+    let mut job_ids = Vec::new();
+    for (uri, body) in [
+        (format!("/v1/repositories/{repo_id}/index"), json!({})),
+        (
+            format!("/v1/repositories/{repo_id}/index"),
+            json!({"full": true}),
+        ),
+        (
+            "/v1/verification".to_string(),
+            json!({"repo": repo_id, "base": "HEAD~1", "head": "HEAD"}),
+        ),
+        (
+            "/v1/evaluation/runs".to_string(),
+            json!({"repo": repo_id, "suite": suite_path.to_string_lossy()}),
+        ),
+    ] {
+        let (status, resp) = send(&app, request("POST", &uri, Some(body), None)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::ACCEPTED,
+            "submit ok: {resp}"
+        );
+        job_ids.push(resp["data"]["job_id"].as_str().unwrap().to_string());
+    }
+    let mut unique = job_ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 4, "four distinct logical jobs");
+    for id in &job_ids {
+        let job = wait_terminal(&app, id).await;
+        assert_eq!(job["data"]["state"], "succeeded", "job {id}: {job}");
+    }
 }

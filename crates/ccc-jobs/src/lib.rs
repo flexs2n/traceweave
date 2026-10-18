@@ -55,7 +55,9 @@ pub async fn begin_job(
     }
 }
 
-/// Marks the job `succeeded` with the given result payload.
+/// Marks the job `succeeded` with the given result payload. The payload is
+/// persisted in the ledger so later readers of the job resource see it
+/// (TIS §15.1) — not just the finishing caller.
 pub async fn finish_success(
     store: &dyn JobStore,
     mut job: JobRecord,
@@ -75,6 +77,7 @@ pub async fn finish_success(
         .await?;
     if let Some(payload) = payload_json {
         job.payload_json = Some(payload.to_string());
+        store.set_job_payload(job.job_id, payload).await?;
     }
     Ok(JobRecord {
         state: JobState::Succeeded,
@@ -208,5 +211,34 @@ mod tests {
         assert_eq!(failed.error_code.as_deref(), Some("INDEX_STALE"));
         let stored = store.get_job(failed.job_id).await.unwrap().unwrap();
         assert_eq!(stored.error_message.as_deref(), Some("generation mismatch"));
+    }
+
+    #[tokio::test]
+    async fn success_payload_is_persisted_for_later_readers() {
+        let store = job_store();
+        let repo = RepositoryId::generate();
+        let job = begin_job(
+            &store,
+            repo,
+            "eval_run",
+            &idempotency_key(&["e", "1"]),
+            None,
+        )
+        .await
+        .unwrap();
+        finish_success(&store, job, Some(r#"{"run_id":"r-1"}"#))
+            .await
+            .unwrap();
+        // A fresh reader of the ledger (e.g. a job poll) sees the payload.
+        let stored = store
+            .get_job(repo_job(&store, repo).await)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.payload_json.as_deref(), Some(r#"{"run_id":"r-1"}"#));
+    }
+
+    async fn repo_job(store: &InMemoryJobStore, repo: RepositoryId) -> JobId {
+        store.list_jobs(repo).await.unwrap()[0].job_id
     }
 }

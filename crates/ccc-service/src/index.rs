@@ -18,36 +18,27 @@ pub async fn index_repo(
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let repo = resolve_repo(store, repo_path).await?;
-    index_repo_record(ctx, &repo, full, snapshot_id).await
+    index_repo_record(ctx, &repo, full, snapshot_id, None).await
 }
 
 /// The index operation against an already-resolved repository record (the
 /// REST/MCP adapters resolve `{id}` path params themselves, T4 job runner
-/// included).
+/// included). `external_key` (an `Idempotency-Key` header) replaces the
+/// derived key when present — one logical job per key either way (TIS §13.3).
 pub async fn index_repo_record(
     ctx: &AppContext,
     repo: &RepositoryRecord,
     full: bool,
     snapshot_id: Option<&str>,
+    external_key: Option<&str>,
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let artifacts = &*ctx.artifacts;
     let cfg = ccc_config::load_config(&ccc_config::resolve_data_dir(None))?;
-    // The idempotency key includes the current repository state (HEAD + dirty
-    // flag): re-running against the same tree replays one logical job, while
-    // a changed tree is a genuinely new request.
-    let root = PathBuf::from(&repo.root_path);
-    let head = GitCli.rev_parse_head(&root)?.unwrap_or_default();
-    let dirty = !GitCli.status_porcelain(&root)?.is_empty();
-    let key = jobs::idempotency_key(&[
-        "index",
-        &repo.repository_id.to_string(),
-        &format!("{full}"),
-        snapshot_id.unwrap_or("current"),
-        &cfg.indexing().configuration_hash()?,
-        &head,
-        &format!("{dirty}"),
-    ]);
+    let key = match external_key {
+        Some(k) => k.to_string(),
+        None => index_job_key(repo, full, snapshot_id).await?,
+    };
     let job = jobs::begin_job(&**store, repo.repository_id, "index", &key, None).await?;
 
     let result = index_once(store, artifacts, repo, &cfg, full, snapshot_id).await;
@@ -109,6 +100,30 @@ pub async fn index_repo_record(
             Err(e)
         }
     }
+}
+
+/// The index idempotency key: includes the current repository state (HEAD +
+/// dirty flag) — re-running against the same tree replays one logical job,
+/// while a changed tree is a genuinely new request. Single source for the
+/// synchronous op and the async submit path (T4).
+pub async fn index_job_key(
+    repo: &RepositoryRecord,
+    full: bool,
+    snapshot_id: Option<&str>,
+) -> Result<String, CccError> {
+    let cfg = ccc_config::load_config(&ccc_config::resolve_data_dir(None))?;
+    let root = PathBuf::from(&repo.root_path);
+    let head = GitCli.rev_parse_head(&root)?.unwrap_or_default();
+    let dirty = !GitCli.status_porcelain(&root)?.is_empty();
+    Ok(jobs::idempotency_key(&[
+        "index",
+        &repo.repository_id.to_string(),
+        &format!("{full}"),
+        snapshot_id.unwrap_or("current"),
+        &cfg.indexing().configuration_hash()?,
+        &head,
+        &format!("{dirty}"),
+    ]))
 }
 
 pub async fn index_once(

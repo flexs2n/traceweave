@@ -11,13 +11,13 @@
 
 use axum::{
     extract::{Path, Query, Request, State},
-    http::{HeaderName, StatusCode},
+    http::{HeaderMap, HeaderName, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use ccc_domain::{CccError, ErrorCode};
+use ccc_domain::{CccError, ErrorCode, JobId};
 use ccc_schema::{Envelope, EnvelopeMeta, ErrorEnvelope, SCHEMA_VERSION};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -34,6 +34,162 @@ pub struct AppState {
     pub ctx: Arc<ccc_service::AppContext>,
     /// When set, every request must present `Authorization: Bearer <token>`.
     pub token: Option<String>,
+    /// Bounded executor for heavy jobs (index/verify/eval).
+    pub jobs: Arc<JobRunner>,
+}
+
+impl AppState {
+    /// Convenience constructor wiring the shared context into the runner.
+    pub fn new(ctx: ccc_service::AppContext, token: Option<String>) -> Self {
+        let ctx = Arc::new(ctx);
+        Self {
+            ctx: ctx.clone(),
+            token,
+            jobs: Arc::new(JobRunner::new(ctx)),
+        }
+    }
+}
+
+/// Bounded async job execution (T4): heavy operations run in spawned tasks
+/// gated by a semaphore (≤ 2 at once; SQLite's single serialized writer sits
+/// underneath), results land in the same job ledger the CLI records, and
+/// clients poll `GET /v1/jobs/{id}`. There is no cancel endpoint (documented
+/// limitation, consistent with the CLI).
+#[derive(Clone)]
+pub struct JobRunner {
+    ctx: Arc<ccc_service::AppContext>,
+    sem: Arc<tokio::sync::Semaphore>,
+    /// Job ids currently executing in this process — a duplicate submit of a
+    /// non-terminal job never double-executes (TIS §13.3).
+    inflight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Per-repository execution locks: two index/verify/eval runs on the same
+    /// repository serialize (the CLI never runs them concurrently); jobs on
+    /// different repositories may overlap within the semaphore bound.
+    repo_locks:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl JobRunner {
+    pub fn new(ctx: Arc<ccc_service::AppContext>) -> Self {
+        Self {
+            ctx,
+            sem: Arc::new(tokio::sync::Semaphore::new(2)),
+            inflight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            repo_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Free heavy-job slots (exposed for tests/monitoring).
+    pub fn available_heavy_slots(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    async fn repo_lock(
+        &self,
+        repository_id: &ccc_domain::RepositoryId,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.repo_locks.lock().await;
+        locks.entry(repository_id.to_string()).or_default().clone()
+    }
+
+    async fn mark(&self, job_id: JobId) -> bool {
+        self.inflight.lock().await.insert(job_id.to_string())
+    }
+
+    fn spawn<F>(&self, job_id: JobId, repo_lock: Arc<tokio::sync::Mutex<()>>, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let sem = self.sem.clone();
+        let inflight = self.inflight.clone();
+        tokio::spawn(async move {
+            // Repository work serializes first; the semaphore only bounds how
+            // many repos are actively processed at once (T4 ≤ 2).
+            let _repo = repo_lock.lock().await;
+            let _permit = sem.acquire().await;
+            fut.await;
+            inflight.lock().await.remove(&job_id.to_string());
+        });
+    }
+
+    pub async fn submit_index(
+        &self,
+        job_id: JobId,
+        repo: ccc_domain::RepositoryRecord,
+        full: bool,
+        snapshot: Option<String>,
+        key: String,
+    ) {
+        if !self.mark(job_id).await {
+            return;
+        }
+        let ctx = self.ctx.clone();
+        let lock = self.repo_lock(&repo.repository_id).await;
+        self.spawn(job_id, lock, async move {
+            if let Err(e) =
+                ccc_service::index_repo_record(&ctx, &repo, full, snapshot.as_deref(), Some(&key))
+                    .await
+            {
+                let _ = ccc_service::fail_job(&ctx.store, job_id, &e).await;
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_verify(
+        &self,
+        job_id: JobId,
+        repo: ccc_domain::RepositoryRecord,
+        base: String,
+        head: Option<String>,
+        policy: String,
+        format: String,
+        key: String,
+    ) {
+        if !self.mark(job_id).await {
+            return;
+        }
+        let ctx = self.ctx.clone();
+        let lock = self.repo_lock(&repo.repository_id).await;
+        self.spawn(job_id, lock, async move {
+            if let Err(e) = ccc_service::verify_record(
+                &ctx,
+                &repo,
+                &base,
+                head.as_deref(),
+                &policy,
+                &format,
+                Some(&key),
+            )
+            .await
+            {
+                let _ = ccc_service::fail_job(&ctx.store, job_id, &e).await;
+            }
+        });
+    }
+
+    pub async fn submit_eval(
+        &self,
+        job_id: JobId,
+        repo: ccc_domain::RepositoryRecord,
+        suite: String,
+        policy: Option<String>,
+        key: String,
+    ) {
+        if !self.mark(job_id).await {
+            return;
+        }
+        let ctx = self.ctx.clone();
+        let lock = self.repo_lock(&repo.repository_id).await;
+        self.spawn(job_id, lock, async move {
+            if let Err(e) =
+                ccc_service::eval_run_record(&ctx, &repo, &suite, policy.as_deref(), Some(&key))
+                    .await
+            {
+                let _ = ccc_service::fail_job(&ctx.store, job_id, &e).await;
+            }
+        });
+    }
 }
 
 /// Serve-time configuration (T5 wires config file + env precedence).
@@ -93,6 +249,26 @@ fn json_envelope<T: serde::Serialize>(data: &T, meta: EnvelopeMeta) -> ApiEnvelo
         data,
         meta: Some(meta),
     }
+}
+
+/// `202 Accepted` + `Location: /v1/jobs/{id}` + the job record as the body
+/// (TIS §13.1: clients poll the job resource, requests never stay open).
+fn accepted(job_id: &str, envelope: ApiEnvelope) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        [("Location", format!("/v1/jobs/{job_id}"))],
+        Json(envelope),
+    )
+        .into_response()
+}
+
+/// `Idempotency-Key` header wins over an optional body field (TIS §13.3).
+fn idempotency_key(headers: &HeaderMap, body_key: Option<&str>) -> Option<String> {
+    headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| body_key.map(str::to_string))
 }
 
 // ---------------------------------------------------------------------------
@@ -282,19 +458,39 @@ async fn repository_get(
     request_body = IndexJobRequest,
     params(("id" = String, Path, description = "Repository id or path")),
     responses(
-        (status = 200, description = "Indexed synchronously in this step", body = EnvelopeDoc),
+        (status = 202, description = "Job accepted; poll /v1/jobs/{{id}}", body = EnvelopeDoc),
         (status = 404, body = EnvelopeDoc)
     )
 )]
 async fn repository_index(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<IndexJobRequest>,
-) -> Result<Json<ApiEnvelope>, ApiError> {
+) -> Result<Response, ApiError> {
     let repo = ccc_service::resolve_repo_ref(&state.ctx.store, &id).await?;
-    let out = ccc_service::index_repo_record(&state.ctx, &repo, req.full, req.snapshot.as_deref())
-        .await?;
-    Ok(Json(out.envelope()))
+    let key = idempotency_key(&headers, req.idempotency_key.as_deref());
+    let job = match &key {
+        Some(k) => ccc_service::begin_job(&state.ctx.store, repo.repository_id, "index", k).await?,
+        None => {
+            let k = ccc_service::index_job_key(&repo, req.full, req.snapshot.as_deref()).await?;
+            ccc_service::begin_job(&state.ctx.store, repo.repository_id, "index", &k).await?
+        }
+    };
+    if !job.state.is_terminal() {
+        state
+            .jobs
+            .submit_index(
+                job.job_id,
+                repo,
+                req.full,
+                req.snapshot.clone(),
+                job.idempotency_key,
+            )
+            .await;
+    }
+    let out = ccc_service::job_get(&state.ctx, &job.job_id.to_string()).await?;
+    Ok(accepted(&job.job_id.to_string(), out.envelope()))
 }
 
 #[utoipa::path(
@@ -416,7 +612,7 @@ async fn impact_analyze(
     path = "/v1/verification",
     request_body = VerificationRequest,
     responses(
-        (status = 200, description = "Analysis-mode report (synchronous in this step)", body = EnvelopeDoc),
+        (status = 202, description = "Job accepted; poll /v1/jobs/{{id}}", body = EnvelopeDoc),
         (status = 400, body = EnvelopeDoc),
         (status = 403, body = EnvelopeDoc),
         (status = 404, body = EnvelopeDoc)
@@ -424,22 +620,46 @@ async fn impact_analyze(
 )]
 async fn verification_request(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<VerificationRequest>,
-) -> Result<Json<ApiEnvelope>, ApiError> {
+) -> Result<Response, ApiError> {
     let repo = match &req.repo {
         Some(r) => ccc_service::resolve_repo_ref(&state.ctx.store, r).await?,
         None => ccc_service::resolve_repo(&state.ctx.store, None).await?,
     };
-    let out = ccc_service::verify_record(
-        &state.ctx,
-        &repo,
-        &req.base,
-        req.head.as_deref(),
-        req.policy.as_deref().unwrap_or("analysis"),
-        req.format.as_deref().unwrap_or("json"),
-    )
-    .await?;
-    Ok(Json(out.envelope()))
+    let policy = req.policy.unwrap_or_else(|| "analysis".into());
+    let key = idempotency_key(&headers, None);
+    let job = match &key {
+        Some(k) => {
+            ccc_service::begin_job(&state.ctx.store, repo.repository_id, "verify", k).await?
+        }
+        None => {
+            let k = ccc_service::verify_job_key(
+                &state.ctx.data_dir,
+                &repo,
+                &req.base,
+                req.head.as_deref(),
+                &policy,
+            )?;
+            ccc_service::begin_job(&state.ctx.store, repo.repository_id, "verify", &k).await?
+        }
+    };
+    if !job.state.is_terminal() {
+        state
+            .jobs
+            .submit_verify(
+                job.job_id,
+                repo,
+                req.base.clone(),
+                req.head.clone(),
+                policy,
+                req.format.unwrap_or_else(|| "json".into()),
+                job.idempotency_key,
+            )
+            .await;
+    }
+    let out = ccc_service::job_get(&state.ctx, &job.job_id.to_string()).await?;
+    Ok(accepted(&job.job_id.to_string(), out.envelope()))
 }
 
 #[utoipa::path(
@@ -447,22 +667,49 @@ async fn verification_request(
     path = "/v1/evaluation/runs",
     request_body = EvalRunRequest,
     responses(
-        (status = 200, body = EnvelopeDoc),
+        (status = 202, description = "Job accepted; poll /v1/jobs/{{id}}", body = EnvelopeDoc),
         (status = 400, body = EnvelopeDoc),
         (status = 404, body = EnvelopeDoc)
     )
 )]
 async fn eval_run_post(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<EvalRunRequest>,
-) -> Result<Json<ApiEnvelope>, ApiError> {
+) -> Result<Response, ApiError> {
     let repo = match &req.repo {
         Some(r) => ccc_service::resolve_repo_ref(&state.ctx.store, r).await?,
         None => ccc_service::resolve_repo(&state.ctx.store, None).await?,
     };
-    let out =
-        ccc_service::eval_run_record(&state.ctx, &repo, &req.suite, req.policy.as_deref()).await?;
-    Ok(Json(out.envelope()))
+    let key = idempotency_key(&headers, None);
+    let job = match &key {
+        Some(k) => {
+            ccc_service::begin_job(&state.ctx.store, repo.repository_id, "eval_run", k).await?
+        }
+        None => {
+            let k = ccc_service::eval_run_job_key(
+                &state.ctx.data_dir,
+                &repo,
+                &req.suite,
+                req.policy.as_deref(),
+            )?;
+            ccc_service::begin_job(&state.ctx.store, repo.repository_id, "eval_run", &k).await?
+        }
+    };
+    if !job.state.is_terminal() {
+        state
+            .jobs
+            .submit_eval(
+                job.job_id,
+                repo,
+                req.suite.clone(),
+                req.policy.clone(),
+                job.idempotency_key,
+            )
+            .await;
+    }
+    let out = ccc_service::job_get(&state.ctx, &job.job_id.to_string()).await?;
+    Ok(accepted(&job.job_id.to_string(), out.envelope()))
 }
 
 #[utoipa::path(
@@ -619,9 +866,11 @@ pub async fn serve_listener(
     token: Option<String>,
 ) -> Result<(), CccError> {
     init_tracing();
+    let ctx = Arc::new(ctx);
     let app = router(AppState {
-        ctx: Arc::new(ctx),
+        ctx: ctx.clone(),
         token,
+        jobs: Arc::new(JobRunner::new(ctx)),
     });
     axum::serve(listener, app)
         .await

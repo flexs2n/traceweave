@@ -277,6 +277,9 @@ pub trait JobStore: Send + Sync {
         error_code: Option<&str>,
         error_message: Option<&str>,
     ) -> StoreResult<()>;
+    /// Persists the job's result payload (set on success, TIS §15.1) so
+    /// later readers of the ledger see it, not just the finishing caller.
+    async fn set_job_payload(&self, id: JobId, payload_json: &str) -> StoreResult<()>;
     async fn list_jobs(&self, repository_id: RepositoryId) -> StoreResult<Vec<JobRecord>>;
 }
 

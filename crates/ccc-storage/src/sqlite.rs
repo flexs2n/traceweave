@@ -1680,6 +1680,16 @@ impl JobStore for SqliteStore {
         Ok(())
     }
 
+    async fn set_job_payload(&self, id: JobId, payload_json: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE jobs SET payload_json = ? WHERE job_id = ?")
+            .bind(payload_json)
+            .bind(id.to_string())
+            .execute(&self.writer)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn list_jobs(&self, repository_id: RepositoryId) -> StoreResult<Vec<JobRecord>> {
         let rows = sqlx::query("SELECT * FROM jobs WHERE repository_id = ? ORDER BY created_at")
             .bind(repository_id.to_string())

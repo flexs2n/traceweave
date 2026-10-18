@@ -51,41 +51,34 @@ pub async fn eval_run(
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let repo = resolve_repo(store, repo_path).await?;
-    eval_run_record(ctx, &repo, suite_name, policy_path).await
+    eval_run_record(ctx, &repo, suite_name, policy_path, None).await
 }
 
 /// The eval operation against an already-resolved repository record.
+/// `external_key` (an `Idempotency-Key` header) replaces the derived key
+/// when present.
 pub async fn eval_run_record(
     ctx: &AppContext,
     repo: &RepositoryRecord,
     suite_name: &str,
     policy_path: Option<&str>,
+    external_key: Option<&str>,
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let artifacts = &*ctx.artifacts;
     let data_dir = &ctx.data_dir;
     let cfg = ccc_config::load_config(data_dir)?;
     let config_hash = cfg.indexing().configuration_hash()?;
+    let key = match external_key {
+        Some(k) => k.to_string(),
+        None => eval_run_job_key(data_dir, repo, suite_name, policy_path)?,
+    };
     let suite_path = ccc_evaluation::resolve_suite_path(data_dir, suite_name)?;
     let suite = ccc_evaluation::load_suite(&suite_path)?;
     let weights_override = match policy_path {
         Some(p) => Some(load_weights_override(std::path::Path::new(p))?),
         None => None,
     };
-    // The effective weights hash rides in the idempotency key so an A/B
-    // experiment with different weights is a distinct logical job.
-    let weights_hash = match &weights_override {
-        Some(w) => ccc_schema::hash_canonical(w)
-            .map_err(|e| CccError::internal_error(format!("weights hash: {e}")))?,
-        None => "current".into(),
-    };
-    let key = jobs::idempotency_key(&[
-        "eval_run",
-        &repo.repository_id.to_string(),
-        &suite.suite_hash,
-        &config_hash,
-        &weights_hash,
-    ]);
     let job = jobs::begin_job(&**store, repo.repository_id, "eval_run", &key, None).await?;
 
     let search = FtsSearchBackend::new(&**store, &**store, &**store);
@@ -161,6 +154,36 @@ pub async fn eval_run_record(
             Err(e)
         }
     }
+}
+
+/// The eval idempotency key: suite hash + config hash + effective weights
+/// hash (an A/B experiment with different weights is a distinct logical job).
+/// Single source for the synchronous op and the async submit path (T4).
+pub fn eval_run_job_key(
+    data_dir: &std::path::Path,
+    repo: &RepositoryRecord,
+    suite_name: &str,
+    policy_path: Option<&str>,
+) -> Result<String, CccError> {
+    let cfg = ccc_config::load_config(data_dir)?;
+    let config_hash = cfg.indexing().configuration_hash()?;
+    let suite_path = ccc_evaluation::resolve_suite_path(data_dir, suite_name)?;
+    let suite = ccc_evaluation::load_suite(&suite_path)?;
+    let weights_hash = match policy_path {
+        Some(p) => {
+            let weights = load_weights_override(std::path::Path::new(p))?;
+            ccc_schema::hash_canonical(&weights)
+                .map_err(|e| CccError::internal_error(format!("weights hash: {e}")))?
+        }
+        None => "current".into(),
+    };
+    Ok(jobs::idempotency_key(&[
+        "eval_run",
+        &repo.repository_id.to_string(),
+        &suite.suite_hash,
+        &config_hash,
+        &weights_hash,
+    ]))
 }
 
 pub async fn eval_show(ctx: &AppContext, run_id: &str) -> Result<OpOutput, CccError> {

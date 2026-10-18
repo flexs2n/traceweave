@@ -17,8 +17,21 @@ pub async fn index_repo(
     snapshot_id: Option<&str>,
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
-    let artifacts = &*ctx.artifacts;
     let repo = resolve_repo(store, repo_path).await?;
+    index_repo_record(ctx, &repo, full, snapshot_id).await
+}
+
+/// The index operation against an already-resolved repository record (the
+/// REST/MCP adapters resolve `{id}` path params themselves, T4 job runner
+/// included).
+pub async fn index_repo_record(
+    ctx: &AppContext,
+    repo: &RepositoryRecord,
+    full: bool,
+    snapshot_id: Option<&str>,
+) -> Result<OpOutput, CccError> {
+    let store = &ctx.store;
+    let artifacts = &*ctx.artifacts;
     let cfg = ccc_config::load_config(&ccc_config::resolve_data_dir(None))?;
     // The idempotency key includes the current repository state (HEAD + dirty
     // flag): re-running against the same tree replays one logical job, while
@@ -37,7 +50,7 @@ pub async fn index_repo(
     ]);
     let job = jobs::begin_job(&**store, repo.repository_id, "index", &key, None).await?;
 
-    let result = index_once(store, artifacts, &repo, &cfg, full, snapshot_id).await;
+    let result = index_once(store, artifacts, repo, &cfg, full, snapshot_id).await;
     match result {
         Ok(outcome) => {
             // Freshness projection (FR-043): memories linked to claims that
@@ -87,11 +100,7 @@ pub async fn index_repo(
             });
             output(
                 &data,
-                meta_for(
-                    &repo,
-                    Some(outcome.snapshot_id),
-                    Some(outcome.generation_id),
-                ),
+                meta_for(repo, Some(outcome.snapshot_id), Some(outcome.generation_id)),
                 human,
             )
         }

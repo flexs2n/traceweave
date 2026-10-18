@@ -15,6 +15,18 @@ pub async fn impact_analyze(
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let repo = resolve_repo(store, repo_path).await?;
+    impact_analyze_record(ctx, &repo, base, head, format).await
+}
+
+/// The impact operation against an already-resolved repository record.
+pub async fn impact_analyze_record(
+    ctx: &AppContext,
+    repo: &ccc_domain::RepositoryRecord,
+    base: &str,
+    head: Option<&str>,
+    format: &str,
+) -> Result<OpOutput, CccError> {
+    let store = &ctx.store;
     let root = PathBuf::from(&repo.root_path);
     let key = ccc_jobs::idempotency_key(&[
         "impact_analyze",
@@ -39,9 +51,9 @@ pub async fn impact_analyze(
             };
             let out = if format == "markdown" {
                 let human = render_impact_markdown(&report);
-                output(&report, meta_for(&repo, None, None), human)?
+                output(&report, meta_for(repo, None, None), human)?
             } else {
-                output_envelope_as_human(&report, meta_for(&repo, None, None))?
+                output_envelope_as_human(&report, meta_for(repo, None, None))?
             };
             Ok(out)
         }

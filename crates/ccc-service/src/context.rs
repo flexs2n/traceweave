@@ -18,8 +18,21 @@ pub async fn context_compile(
     format: &str,
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
-    let artifacts = &*ctx.artifacts;
     let repo = resolve_repo(store, repo_path).await?;
+    context_compile_record(ctx, &repo, task, budget, format).await
+}
+
+/// The compile operation against an already-resolved repository record
+/// (REST/MCP adapters resolve the repo themselves).
+pub async fn context_compile_record(
+    ctx: &AppContext,
+    repo: &RepositoryRecord,
+    task: &str,
+    budget: u64,
+    format: &str,
+) -> Result<OpOutput, CccError> {
+    let store = &ctx.store;
+    let artifacts = &*ctx.artifacts;
     let key = jobs::idempotency_key(&[
         "context_compile",
         &repo.repository_id.to_string(),
@@ -70,9 +83,9 @@ pub async fn context_compile(
             };
             let out = if format == "markdown" {
                 let human = ccc_context_compiler::bundle_markdown(&bundle);
-                output(&bundle, meta_for(&repo, None, None), human)?
+                output(&bundle, meta_for(repo, None, None), human)?
             } else {
-                output_envelope_as_human(&bundle, meta_for(&repo, None, None))?
+                output_envelope_as_human(&bundle, meta_for(repo, None, None))?
             };
             Ok(out)
         }

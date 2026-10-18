@@ -16,9 +16,24 @@ pub async fn verify(
     format: &str,
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
+    let repo = resolve_repo(store, repo_path).await?;
+    verify_record(ctx, &repo, base, head, policy_name, format).await
+}
+
+/// The verify operation against an already-resolved repository record (the
+/// T4 job runner resolves once, then executes).
+#[allow(clippy::too_many_arguments)]
+pub async fn verify_record(
+    ctx: &AppContext,
+    repo: &ccc_domain::RepositoryRecord,
+    base: &str,
+    head: Option<&str>,
+    policy_name: &str,
+    format: &str,
+) -> Result<OpOutput, CccError> {
+    let store = &ctx.store;
     let artifacts = &*ctx.artifacts;
     let data_dir = &ctx.data_dir;
-    let repo = resolve_repo(store, repo_path).await?;
     let root = PathBuf::from(&repo.root_path);
     let cfg = ccc_config::load_config(data_dir)?;
     // Policies come only from the data dir; an unknown name is INVALID_REQUEST
@@ -50,7 +65,7 @@ pub async fn verify(
         &GitCli,
         cfg.indexing().traversal_depth,
     );
-    match engine.verify(&repo, &root, base, head, &policy).await {
+    match engine.verify(repo, &root, base, head, &policy).await {
         Ok(report) => {
             let payload = serde_json::json!({
                 "verification_id": report.verification_id,
@@ -64,9 +79,9 @@ pub async fn verify(
             };
             let out = if format == "markdown" {
                 let human = ccc_verification::render_verification_markdown(&report);
-                output(&report, meta_for(&repo, None, None), human)?
+                output(&report, meta_for(repo, None, None), human)?
             } else {
-                output_envelope_as_human(&report, meta_for(&repo, None, None))?
+                output_envelope_as_human(&report, meta_for(repo, None, None))?
             };
             Ok(out)
         }

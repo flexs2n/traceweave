@@ -12,6 +12,17 @@ pub async fn search(
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
     let repo = resolve_repo(store, repo_path).await?;
+    search_record(ctx, &repo, query, limit).await
+}
+
+/// The search operation against an already-resolved repository record.
+pub async fn search_record(
+    ctx: &AppContext,
+    repo: &ccc_domain::RepositoryRecord,
+    query: &str,
+    limit: u32,
+) -> Result<OpOutput, CccError> {
+    let store = &ctx.store;
     let backend = FtsSearchBackend::new(&**store, &**store, &**store);
     let response = backend
         .search(SearchRequest {
@@ -37,7 +48,7 @@ pub async fn search(
     output(
         &response,
         meta_for(
-            &repo,
+            repo,
             Some(response.snapshot_id),
             Some(response.generation_id),
         ),

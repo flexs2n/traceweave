@@ -17,26 +17,28 @@ mod evidence;
 mod export;
 mod impact;
 mod index;
+mod jobs_lookup;
 mod memory;
 mod repo;
 mod search;
 mod snapshot;
 mod verify;
 
-pub use context::{context_compile, context_diff, context_show};
-pub use eval::{eval_run, eval_show};
+pub use context::{context_compile, context_compile_record, context_diff, context_show};
+pub use eval::{eval_run, eval_run_record, eval_show};
 pub use evidence::{evidence_list, evidence_show};
 pub use export::export_data;
-pub use impact::impact_analyze;
-pub use index::{index_current, index_once, index_repo, status};
+pub use impact::{impact_analyze, impact_analyze_record};
+pub use index::{index_current, index_once, index_repo, index_repo_record, status};
+pub use jobs_lookup::job_get;
 pub use memory::{
     conflicts, memory_add, memory_list, memory_resolve, memory_retract, memory_search, memory_show,
     memory_supersede,
 };
-pub use repo::{repo_add, repo_status};
-pub use search::search;
+pub use repo::{repo_add, repo_metadata, repo_snapshots, repo_status};
+pub use search::{search, search_record};
 pub use snapshot::snapshot_diff;
-pub use verify::{policies_list, policies_show, verify};
+pub use verify::{policies_list, policies_show, verify, verify_record};
 
 use ccc_domain::{CccError, RepositoryId, RepositoryRecord, SnapshotId};
 use ccc_schema::{Envelope, EnvelopeMeta, SCHEMA_VERSION};
@@ -191,6 +193,24 @@ pub async fn resolve_repo(
     Err(CccError::repository_not_found(
         "no repository specified and none matches the current directory; use --repo <path>",
     ))
+}
+
+/// Resolves a repository from a raw identifier string first (the REST/MCP
+/// path-parameter form), falling back to path resolution. Unknown ids are
+/// REPOSITORY_NOT_FOUND — never a silent fallback.
+pub async fn resolve_repo_ref(
+    store: &ccc_storage::SqliteStore,
+    id_or_path: &str,
+) -> Result<RepositoryRecord, CccError> {
+    if let Ok(id) = RepositoryId::from_str(id_or_path) {
+        if let Some(found) = store.get_repository(id).await? {
+            return Ok(found);
+        }
+        return Err(CccError::repository_not_found(format!(
+            "no registered repository with id {id_or_path}"
+        )));
+    }
+    resolve_repo(store, Some(std::path::Path::new(id_or_path))).await
 }
 
 /// Snapshot a memory is authored against: the active generation's snapshot

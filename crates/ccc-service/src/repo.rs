@@ -69,3 +69,24 @@ pub async fn repo_status(ctx: &AppContext, path: Option<&Path>) -> Result<OpOutp
     }
     output(&repos, ccc_schema::EnvelopeMeta::default(), human)
 }
+
+/// One repository's metadata by id, with the FR-010 drift projection in meta
+/// (REST `GET /v1/repositories/{id}`).
+pub async fn repo_metadata(ctx: &AppContext, id: &str) -> Result<OpOutput, CccError> {
+    let store: &SqliteStore = &ctx.store;
+    let repo = crate::resolve_repo_ref(store, id).await?;
+    let current = crate::index_current(store, &repo).await?;
+    let meta = ccc_schema::EnvelopeMeta {
+        index_current: Some(current),
+        ..Default::default()
+    };
+    output(&repo, meta, String::new())
+}
+
+/// Snapshot records for one repository (REST GET /v1/repositories/{id}/snapshots).
+pub async fn repo_snapshots(ctx: &AppContext, id: &str) -> Result<OpOutput, CccError> {
+    let store: &SqliteStore = &ctx.store;
+    let repo = crate::resolve_repo_ref(store, id).await?;
+    let snapshots = store.list_snapshots(repo.repository_id).await?;
+    output(&snapshots, meta_for(&repo, None, None), String::new())
+}

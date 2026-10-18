@@ -50,9 +50,20 @@ pub async fn eval_run(
     policy_path: Option<&str>,
 ) -> Result<OpOutput, CccError> {
     let store = &ctx.store;
+    let repo = resolve_repo(store, repo_path).await?;
+    eval_run_record(ctx, &repo, suite_name, policy_path).await
+}
+
+/// The eval operation against an already-resolved repository record.
+pub async fn eval_run_record(
+    ctx: &AppContext,
+    repo: &RepositoryRecord,
+    suite_name: &str,
+    policy_path: Option<&str>,
+) -> Result<OpOutput, CccError> {
+    let store = &ctx.store;
     let artifacts = &*ctx.artifacts;
     let data_dir = &ctx.data_dir;
-    let repo = resolve_repo(store, repo_path).await?;
     let cfg = ccc_config::load_config(data_dir)?;
     let config_hash = cfg.indexing().configuration_hash()?;
     let suite_path = ccc_evaluation::resolve_suite_path(data_dir, suite_name)?;
@@ -82,7 +93,7 @@ pub async fn eval_run(
         &**store, &**store, &**store, &**store, artifacts, &search, &**store,
     );
     match runner
-        .run_suite(&repo, &suite, &config_hash, weights_override.as_ref())
+        .run_suite(repo, &suite, &config_hash, weights_override.as_ref())
         .await
     {
         Ok(metrics) => {
@@ -143,7 +154,7 @@ pub async fn eval_run(
                 "run_id": run.run_id.to_string(),
                 "metrics": metrics,
             });
-            output(&data, meta_for(&repo, None, None), human)
+            output(&data, meta_for(repo, None, None), human)
         }
         Err(e) => {
             jobs::finish_failure(&**store, job, &e).await?;

@@ -1,6 +1,6 @@
 # traceweave / ccc
 
-Change-aware context compiler — Step 3 (engineering memory + conflicts).
+Change-aware context compiler — Step 4 (integration layer: service, REST, MCP).
 
 `ccc` indexes a git repository into immutable, content-addressed snapshots,
 extracts Rust symbols and name-level relationships with Tree-sitter, and
@@ -14,7 +14,11 @@ agent-finding capture from failed authorized runs — always `candidate`
 inspectable (FR-034), memory FTS search (FR-035), a memory retrieval channel
 in the compiler, conflict-aware bundles (FR-060), and a freshness projection
 where linked memories follow their claims' statuses with recorded causes
-(FR-043). Everything runs locally; no LLM calls are made in this build
+(FR-043). Step 4 exposes it all through integrations (SDD §16, TIS §13/§20.1):
+every operation now lives once in a shared **service layer** consumed by the
+CLI, the REST API (`ccc serve`, FR-093), and a read/analysis MCP server
+(`ccc mcp`, FR-094) — evidence and freshness semantics are never duplicated.
+Everything runs locally; no LLM calls are made in this build
 (NFR-012: provider boundary is an explicit opt-in extension point).
 
 ## Stack
@@ -48,7 +52,10 @@ where linked memories follow their claims' statuses with recorded causes
 | `ccc-verification` | execution policies, test selection, authorized executor, evidence revalidation |
 | `ccc-evaluation` | offline retrieval/integrity harness over hashed suites |
 | `ccc-jobs` | idempotent job records (TIS §15.1 state machine) |
-| `ccc-cli` | the `ccc` user surface |
+| `ccc-service` | the shared operation layer (one home per operation; SDD §16.1) |
+| `ccc-api` | Axum REST `/v1` router + OpenAPI over `ccc-service` (FR-093) |
+| `ccc-mcp` | rmcp stdio server, 8 read/analysis tools (FR-094, TIS §13.5) |
+| `ccc-cli` | the `ccc` user surface (thin adapter: parsing + output selection) |
 
 ## Quick start (smoke trail, dogfooded on this repository)
 
@@ -150,6 +157,90 @@ database             OK   — opened and migrated
 tree_sitter_rust     OK   — grammar parses
 ```
 
+### Step 4: integrations — serve, MCP, jobs (dogfooded on this repository)
+
+Every operation moved once into `ccc-service` (Step 4 T1); the CLI became a
+thin adapter and the golden CLI tests stayed byte-identical (JSON payloads
+are pre-serialized `RawValue`s, so typed records keep their exact field
+order).
+
+```console
+$ ccc serve                             # REST API on 127.0.0.1:7713
+```
+
+```console
+$ curl -s localhost:7713/v1/health
+{"schema_version":"ccc.schema/1","data":{"ok":true,"version":"0.1.0", …}}
+
+$ curl -s localhost:7713/v1/repositories/<id>
+{"schema_version":"ccc.schema/1","data":{…repository…},
+ "meta":{"index_current":true}}
+```
+
+REST facts (TIS §13.1 table + a documented `GET /v1/search` extension):
+
+- Success bodies are the **same versioned envelopes** the CLI prints
+  (`ccc.schema/1`); errors are `ErrorEnvelope` documents with stable TIS
+  §13.2 codes mapped to HTTP statuses (`INVALID_REQUEST`→400,
+  `*_NOT_FOUND`→404, `PERMISSION_DENIED`→403, `INDEX_STALE`/`JOB_CONFLICT`
+  →409, `EXECUTION_NOT_AUTHORIZED`→403, `DEPENDENCY_UNAVAILABLE`→503, …).
+- Heavy operations (`POST /v1/repositories/{id}/index`, `/v1/verification`,
+  `/v1/evaluation/runs`) return **`202 Accepted` + `Location: /v1/jobs/{id}`**
+  and execute through a bounded runner: at most 2 heavy jobs at once,
+  per-repository serialization, and duplicate submissions of a
+  non-terminal job never double-execute. Clients poll `GET /v1/jobs/{id}`
+  (state machine TIS §15.1); job result payloads persist in the ledger.
+  There is no cancel endpoint (documented limitation).
+- `Idempotency-Key` header (TIS §13.3) replaces the derived key when
+  present — one logical job per key; repeated submits against the same tree
+  replay the same job.
+- Security (NFR-020): loopback-only by default; `Authorization: Bearer
+  <token>` when `[api] token` or `CCC_API_TOKEN` is set; a non-loopback
+  bind **without** a token is refused at startup. Config precedence:
+  defaults < `[api]` in `config.toml` < `CCC_API_BIND`/`CCC_API_TOKEN` <
+  `--bind`.
+- `GET /v1/openapi.json` serves the live schema.
+
+```console
+$ ccc mcp          # MCP stdio server (agent integration)
+```
+
+Agent configuration:
+
+```json
+{
+  "mcpServers": {
+    "ccc": {
+      "command": "ccc",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+MCP facts (TIS §13.5): exactly **8 read/analysis tools** —
+`repository_status`, `search_code`, `lookup_symbol`, `trace_dependencies`,
+`compile_context`, `inspect_evidence`, `analyze_change_impact`,
+`get_verification_results` — every one annotated `read_only` and pinned by
+test (no execution-capable or memory-mutating tool is exposed; memory
+mutation and verification execution are separately permissioned later-step
+work, SDD §16.2). Each invocation is repository-scoped (explicit `repo`
+argument or the configured default via `ccc mcp --repo <id|path>` — no cwd
+fallback); unknown repositories are tool-level errors carrying the stable
+TIS code. Responses embed the same envelope shapes as REST
+(`structuredContent`) with explicit caps: item limits (default 20, hard cap
+50), compile budget cap 16 000 tokens (over-cap is refused before
+compiling), a 1 MB serialized-result cap whose trimming sets
+`"truncated": true` — results are never silently byte-chopped. The MCP
+session smoke verified the full initialize → tools/list → tools/call
+handshake over stdio (protocol version negotiated with the rmcp SDK).
+
+Step 4 also adds the FR-010 **drift projection**: `index_current` (active
+generation's HEAD + dirty flag vs. the repository now) rides in response
+**meta only** — `ccc status` (human + JSON) and the API/compile responses —
+never inside a bundle DTO, so bundle bytes stay identical (pinned by
+tests).
+
 ## Verification model (TIS §11, SDD §15, ADR-008)
 
 - **Policies live only in the data dir** (`~/.ccc/policies/<name>.toml`).
@@ -206,16 +297,39 @@ tree_sitter_rust     OK   — grammar parses
 ## Development
 
 ```console
+scripts/check.ps1        # fmt + clippy -D warnings + cargo test --workspace
+```
+
+```console
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
 
-132 tests cover the Step 3 surface — memory stores/transitions/detection,
-agent-finding capture (never auto-promoted), freshness projection and
-recovery, conflict resolution with recorded rationale, verification
+158 tests cover the Step 4 surface — everything from Steps 1–3 (memory
+stores/transitions/detection, agent-finding capture, freshness projection
+and recovery, conflict resolution with recorded rationale, verification
 policies/executor per status, scoped revalidation, evaluation determinism
-and integrity gates, tier-ordered selection with the memory channel, plus
-the golden CLI integration tests (`crates/ccc-cli/tests/golden.rs`: the
-vertical path and the memory/conflict flow) and the dogfood fixture
-(`tests/fixtures/rust-sample/`).
+and integrity gates, tier-ordered selection with the memory channel, the
+golden CLI integration tests in `crates/ccc-cli/tests/golden.rs`, and the
+dogfood fixture in `tests/fixtures/rust-sample/`) plus the Step 4 additions:
+service-layer extraction (byte-identical golden output via `RawValue`
+payloads), the FR-010 drift guard (clean/dirty/commit-advanced/unindexed),
+the REST `/v1` router (envelope shapes, error-status mapping, token on/off,
+loopback-bind validation, 202+Location job flow with replay and failure
+paths), the bounded job runner, and the MCP adapter (initialize handshake,
+pinned read-only tool surface, budget/trim caps, unknown-repo tool errors).
+
+Open limitations carried forward deliberately:
+
+- No job cancellation endpoint (CLI parity; the local runner re-runs a
+  stale `running` job on resubmit).
+- The MCP surface is read-only by design; memory mutation and verification
+  execution arrive behind explicit permissioning (SDD §16.2).
+- `repo add`/`index` still read `[indexing]` config from the **default**
+  data dir (`CCC_HOME`/`~/.ccc`) rather than `--data-dir` — pre-Step-4
+  behavior preserved verbatim to keep config-hash identity stable; a
+  deliberate unification is future work.
+- D-2 (MSVC env allowlist) and D-3 (locked `ccc.exe` when dogfooding from
+  the same `target/`) still apply; integration tests exercise the router
+  in-process for exactly this reason.

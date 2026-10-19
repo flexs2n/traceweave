@@ -213,3 +213,37 @@ omitted memories are listed with their reason in every bundle.
   memory flips `stale` with the recorded cause while unrelated memories stay
   untouched (`golden_memory_and_conflict_flow`).
 
+
+---
+
+## Step 4 (2026-10-18/19, integration layer): no policy change, no promotion
+
+Step 4 added the integration surface (service extraction, REST `/v1`, MCP
+stdio, async jobs, FR-010 drift projection). Retrieval-policy weights are
+**untouched** — policy-v1 remains the only retrieval policy; no A/B was run
+because no ranking path changed (ADR-008 requires an experiment only for
+retrieval behavior changes). The bundle contract is provably unchanged: the
+golden CLI tests stayed byte-identical through the extraction (payloads are
+pre-serialized `RawValue`s, preserving typed-record field order), and the
+two-identical-compiles determinism test plus the `w_h = 0` memory-absence
+test (T9 constraint) stayed green. The drift flag rides in response meta
+only, never in `BundleDto`.
+
+### New dogfood findings (step-4 trail)
+
+- **D-8 (fixed in step 4):** on Windows, `resolve_repo`'s explicit-path
+  branch canonicalized the argument and searched for the `//?/`-prefixed
+  form, while registration stored the prefix-stripped path — so
+  `--repo <path>` (and any REST/MCP path-based resolution) could never
+  match. Resolution now applies the same normalization as registration
+  (pinned by a service test).
+- **D-9 (fixed in step 4):** `finish_success` set the job result payload on
+  the returned record only; `payload_json` was never persisted, so a later
+  reader of the job ledger (the API's job poll) saw `null`. The store now
+  persists payloads (`JobStore::set_job_payload`); the eval flow delivers
+  the recorded run id through the job resource.
+- **Smoke notes:** PowerShell's native-arg quoting mangles inline JSON for
+  `curl.exe` (a D-5 cousin) — the serve smoke posts payloads from a file
+  (`-d @file`). The MCP stdio smoke ran the real initialize → tools/list →
+  tools/call handshake against the built binary; the API integration tests
+  exercise the router in-process (D-3 locked-executable note).

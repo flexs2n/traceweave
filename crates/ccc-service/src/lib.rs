@@ -22,6 +22,7 @@ mod memory;
 mod repo;
 mod search;
 mod snapshot;
+mod trace;
 mod verify;
 
 pub use context::{context_compile, context_compile_record, context_diff, context_show};
@@ -29,7 +30,9 @@ pub use eval::{eval_run, eval_run_job_key, eval_run_record, eval_show};
 pub use evidence::{evidence_list, evidence_show};
 pub use export::export_data;
 pub use impact::{impact_analyze, impact_analyze_record};
-pub use index::{index_current, index_job_key, index_once, index_repo, index_repo_record, status};
+pub use index::{
+    index_current, index_job_key, index_once, index_repo, index_repo_record, status, status_record,
+};
 pub use jobs_lookup::{begin_job, fail_job, job_get, parse_job_id};
 pub use memory::{
     conflicts, memory_add, memory_list, memory_resolve, memory_retract, memory_search, memory_show,
@@ -38,6 +41,7 @@ pub use memory::{
 pub use repo::{repo_add, repo_metadata, repo_snapshots, repo_status};
 pub use search::{search, search_record};
 pub use snapshot::snapshot_diff;
+pub use trace::{trace_dependencies, verification_results};
 pub use verify::{policies_list, policies_show, verify, verify_job_key, verify_record};
 
 use ccc_domain::{CccError, RepositoryId, RepositoryRecord, SnapshotId};
@@ -52,6 +56,7 @@ use std::sync::Arc;
 /// The shared wiring every operation needs: one resolved data directory,
 /// one SQLite store, one artifact store. The CLI, API, and MCP server each
 /// construct this once and pass it to every operation.
+#[derive(Clone)]
 pub struct AppContext {
     /// The resolved data directory (`--data-dir` > `CCC_HOME` > `~/.ccc`).
     pub data_dir: PathBuf,

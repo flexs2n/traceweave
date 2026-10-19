@@ -19,6 +19,7 @@ members = [
     "crates/ccc-jobs",
     "crates/ccc-service",
     "crates/ccc-api",
+    "crates/ccc-mcp",
     "crates/ccc-cli",
 ]
 
@@ -46,6 +47,8 @@ ccc-evaluation = { path = "crates/ccc-evaluation" }
 ccc-jobs = { path = "crates/ccc-jobs" }
 ccc-service = { path = "crates/ccc-service" }
 ccc-api = { path = "crates/ccc-api" }
+ccc-mcp = { path = "crates/ccc-mcp" }
+rmcp = { version = "3.5.1", features = ["server", "transport-io"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

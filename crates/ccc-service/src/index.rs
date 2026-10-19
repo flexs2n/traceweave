@@ -216,8 +216,18 @@ pub async fn status(
 ) -> Result<OpOutput, CccError> {
     let store: &SqliteStore = &ctx.store;
     let repo = resolve_repo(store, repo_path).await?;
+    status_record(ctx, &repo).await
+}
+
+/// The status operation against an already-resolved repository record (the
+/// MCP `repository_status` tool resolves id-or-path itself).
+pub async fn status_record(
+    ctx: &AppContext,
+    repo: &RepositoryRecord,
+) -> Result<OpOutput, CccError> {
+    let store: &SqliteStore = &ctx.store;
     let active = store.get_active_generation(repo.repository_id).await?;
-    let current = index_current(store, &repo).await?;
+    let current = index_current(store, repo).await?;
     let mut status = serde_json::json!({
         "repository_id": repo.repository_id.to_string(),
         "root_path": repo.root_path,
@@ -276,7 +286,7 @@ pub async fn status(
             repo.repository_id, repo.root_path
         ));
     }
-    let mut meta = meta_for(&repo, None, None);
+    let mut meta = meta_for(repo, None, None);
     meta.index_current = Some(current);
     output(&status, meta, human)
 }

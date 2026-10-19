@@ -137,6 +137,13 @@ enum Command {
         #[arg(long)]
         bind: Option<String>,
     },
+    /// Run the MCP stdio server (agent integration; read/analysis tools
+    /// only, TIS §13.5).
+    Mcp {
+        /// Default repository (id or path) for tool calls without `repo`.
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -398,6 +405,10 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
         Command::Init => cmd_init(&data_dir, cli.json).await,
         Command::Doctor => cmd_doctor(&data_dir, cli.json).await,
         Command::Serve { bind } => cmd_serve(&data_dir, bind.as_deref()).await,
+        Command::Mcp { repo } => {
+            let ctx = ccc_service::AppContext::open(&data_dir).await?;
+            ccc_mcp::run_stdio(ctx, repo.clone()).await
+        }
         Command::Policies { command } => match command {
             PoliciesCommand::List => emit(ccc_service::policies_list(&data_dir).await?, cli.json),
             PoliciesCommand::Show { name } => {
@@ -669,7 +680,8 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
                 Command::Init
                 | Command::Doctor
                 | Command::Policies { .. }
-                | Command::Serve { .. } => {
+                | Command::Serve { .. }
+                | Command::Mcp { .. } => {
                     unreachable!("handled above")
                 }
             }

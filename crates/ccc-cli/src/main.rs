@@ -131,6 +131,12 @@ enum Command {
         #[command(subcommand)]
         command: SnapshotCommand,
     },
+    /// Serve the REST API over HTTP (Step 4; loopback by default, NFR-020).
+    Serve {
+        /// Bind address override ([api] bind < CCC_API_BIND < this).
+        #[arg(long)]
+        bind: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -391,6 +397,7 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
     match &cli.command {
         Command::Init => cmd_init(&data_dir, cli.json).await,
         Command::Doctor => cmd_doctor(&data_dir, cli.json).await,
+        Command::Serve { bind } => cmd_serve(&data_dir, bind.as_deref()).await,
         Command::Policies { command } => match command {
             PoliciesCommand::List => emit(ccc_service::policies_list(&data_dir).await?, cli.json),
             PoliciesCommand::Show { name } => {
@@ -659,7 +666,10 @@ async fn dispatch(cli: &Cli) -> Result<(), CccError> {
                     .await?,
                     cli.json,
                 ),
-                Command::Init | Command::Doctor | Command::Policies { .. } => {
+                Command::Init
+                | Command::Doctor
+                | Command::Policies { .. }
+                | Command::Serve { .. } => {
                     unreachable!("handled above")
                 }
             }
@@ -675,8 +685,36 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CccError> {
 }
 
 // ---------------------------------------------------------------------------
-// init / doctor (CLI-only diagnostics; no store required)
+// init / doctor / serve (CLI-only diagnostics; no shared store required)
 // ---------------------------------------------------------------------------
+
+/// `ccc serve` (T5): REST API with config precedence
+/// defaults < [api] in config.toml < CCC_API_BIND/CCC_API_TOKEN < --bind.
+async fn cmd_serve(
+    data_dir: &std::path::Path,
+    bind_override: Option<&str>,
+) -> Result<(), CccError> {
+    let ctx = ccc_service::AppContext::open(data_dir).await?;
+    let cfg = ccc_config::load_config(data_dir)?;
+    let token = std::env::var("CCC_API_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| cfg.api().token.clone());
+    let bind = bind_override
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("CCC_API_BIND")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_else(|| cfg.api().bind.clone());
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|_| CccError::invalid_request(format!("invalid bind address {bind:?}")))?;
+    ccc_api::serve(ctx, ccc_api::ServeConfig { bind: addr, token }).await
+}
 
 async fn cmd_init(data_dir: &std::path::Path, json: bool) -> Result<(), CccError> {
     std::fs::create_dir_all(data_dir)

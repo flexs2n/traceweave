@@ -12,6 +12,7 @@ path = "src/main.rs"
 ccc-domain = { workspace = true }
 ccc-config = { workspace = true }
 ccc-service = { workspace = true }
+ccc-api = { workspace = true }
 ccc-schema = { workspace = true }
 ccc-storage = { workspace = true }
 ccc-tree-sitter = { workspace = true }

@@ -70,16 +70,43 @@ impl IndexingConfig {
     }
 }
 
+/// REST server configuration (Step 4, NFR-020). Not part of the
+/// `configuration_hash` — the server's identity has no effect on snapshot
+/// identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    /// Socket address the REST server binds (default loopback-only).
+    pub bind: String,
+    /// Optional bearer token. A non-loopback bind without a token is refused
+    /// at startup (`CCC_API_TOKEN` env overrides this value).
+    pub token: Option<String>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:7713".into(),
+            token: None,
+        }
+    }
+}
+
 /// Full local configuration, including the data directory location.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct CccConfig {
     pub indexing: IndexingConfig,
+    pub api: ApiConfig,
 }
 
 impl CccConfig {
     pub fn indexing(&self) -> &IndexingConfig {
         &self.indexing
+    }
+
+    pub fn api(&self) -> &ApiConfig {
+        &self.api
     }
 }
 
@@ -103,6 +130,7 @@ pub fn resolve_data_dir(explicit: Option<&Path>) -> PathBuf {
 /// Loads the effective configuration: defaults < file < environment.
 pub fn load_config(data_dir: &Path) -> Result<CccConfig, CccError> {
     let mut indexing = IndexingConfig::default();
+    let mut api = ApiConfig::default();
 
     let file_path = data_dir.join("config.toml");
     if file_path.exists() {
@@ -114,12 +142,14 @@ pub fn load_config(data_dir: &Path) -> Result<CccConfig, CccError> {
         })?;
         let file_cfg: FileConfig = toml::from_str(&raw)
             .map_err(|e| CccError::invalid_request(format!("invalid config.toml: {e}")))?;
-        apply_file(&mut indexing, file_cfg);
+        apply_file(&mut indexing, file_cfg.indexing);
+        apply_api_file(&mut api, file_cfg.api);
     }
 
     apply_env(&mut indexing)?;
+    apply_api_env(&mut api)?;
 
-    Ok(CccConfig { indexing })
+    Ok(CccConfig { indexing, api })
 }
 
 /// Serde shape of the on-disk `config.toml` (all fields optional).
@@ -127,6 +157,36 @@ pub fn load_config(data_dir: &Path) -> Result<CccConfig, CccError> {
 #[serde(default)]
 struct FileConfig {
     indexing: FileIndexing,
+    api: FileApiConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileApiConfig {
+    bind: Option<String>,
+    token: Option<String>,
+}
+
+fn apply_api_file(target: &mut ApiConfig, file: FileApiConfig) {
+    if let Some(v) = file.bind {
+        target.bind = v;
+    }
+    if let Some(v) = file.token {
+        target.token = Some(v);
+    }
+}
+
+fn apply_api_env(target: &mut ApiConfig) -> Result<(), CccError> {
+    if let Ok(v) = std::env::var("CCC_API_BIND") {
+        if !v.trim().is_empty() {
+            target.bind = v.trim().to_string();
+        }
+    }
+    if let Ok(v) = std::env::var("CCC_API_TOKEN") {
+        // Empty string means "no token" (loopback-only semantics).
+        target.token = Some(v.trim().to_string()).filter(|s| !s.is_empty());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -140,8 +200,7 @@ struct FileIndexing {
     max_candidates: Option<usize>,
 }
 
-fn apply_file(target: &mut IndexingConfig, file: FileConfig) {
-    let f = file.indexing;
+fn apply_file(target: &mut IndexingConfig, f: FileIndexing) {
     if let Some(v) = f.include_untracked {
         target.include_untracked = v;
     }
@@ -221,7 +280,7 @@ pub fn write_default_config(data_dir: &Path) -> Result<PathBuf, CccError> {
     }
     let defaults = IndexingConfig::default();
     let body = format!(
-        "# ccc local configuration (defaults; see docs)\n\n[indexing]\ninclude_untracked = {}\nmax_file_size_bytes = {}\nparse_concurrency = {}\ntraversal_depth = {}\nmax_candidates = {}\nexclude_globs = {:?}\n",
+        "# ccc local configuration (defaults; see docs)\n\n[indexing]\ninclude_untracked = {}\nmax_file_size_bytes = {}\nparse_concurrency = {}\ntraversal_depth = {}\nmax_candidates = {}\nexclude_globs = {:?}\n\n# REST server (ccc serve); token enables bearer auth (NFR-020)\n#[api]\n#bind = \"127.0.0.1:7713\"\n#token = \"\"\n",
         defaults.include_untracked,
         defaults.max_file_size_bytes,
         defaults.parse_concurrency,

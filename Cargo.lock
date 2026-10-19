@@ -272,6 +272,7 @@ dependencies = [
 name = "ccc-cli"
 version = "0.1.0"
 dependencies = [
+ "ccc-api",
  "ccc-config",
  "ccc-domain",
  "ccc-schema",
